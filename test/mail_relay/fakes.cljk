@@ -9,6 +9,7 @@
             [envelope.seal :as eseal]
             [kotoba.signal.x25519 :as x25519]
             [mail-relay.authz :as authz]
+            [mail-relay.ito :as ito]
             [mail-relay.worker :as worker]))
 
 (defn kv []
@@ -165,29 +166,68 @@
            (fn [sig] {"x-relay-root" did "x-relay-signature" sig
                       "x-relay-timestamp" (str ts) "x-relay-nonce" nonce}))))
 
-(defn issue-invite
-  "POST /v1/invites を署名つきで叩き、応答を返す。"
-  [env kp did body]
-  (-> (signed-headers kp did :post "/v1/invites")
-      (.then (fn [h] (worker/handle-fetch (request :post "/v1/invites" :headers h :body body) env)))))
+(defn b64url-bytes [^js u8] (eseal/b64url u8))
 
-(defn invited-env
-  "招く側の DID を許可リストに載せた env と、そこで発行した invite を返す。
+(defn client
+  "糸を自分で持つ利用者。Ed25519 の鍵は本物で、entry 1 つごとに署名する。
 
-  -> Promise<{:env … :invite \"inv_…\" :kp … :did …}>"
-  [{:keys [uses] :or {uses 1}} & over]
-  (-> (ed25519-did)
-      (.then (fn [{:keys [kp did]}]
-               (let [e (apply env :RELAY_INVITER_ROOTS did over)]
-                 (-> (issue-invite e kp did {:uses uses})
-                     (.then #(.json ^js %))
-                     (.then (fn [^js b] {:env e :invite (.-invite b) :kp kp :did did}))))))))
+  -> Promise<atom {:did :kp :blocks {cid Uint8Array} :sigs {cid sig} :head cid}>"
+  []
+  (.then (ed25519-did)
+         (fn [{:keys [kp did]}] (atom {:did did :kp kp :blocks {} :sigs {} :head nil}))))
 
-(defn open-inbox [env invite origin]
+(defn append!
+  "糸に entry を 1 つ積んで署名する。`prev` を渡すと、その位置から積む
+  （分岐を作るテスト用）。-> Promise<cid>"
+  ([c state] (append! c state (:head @c)))
+  ([c state prev]
+   (let [put! (fn [cid bytes] (swap! c assoc-in [:blocks cid] bytes))
+         get-fn (fn [cid] (get-in @c [:blocks cid]))
+         cid (ito/append! put! get-fn prev (:did @c) state)]
+     (.then (sign-b64 (:kp @c) (ito/signing-message cid))
+            (fn [sig]
+              (swap! c #(-> % (assoc-in [:sigs cid] sig) (assoc :head cid)))
+              cid)))))
+
+(defn ito-body
+  "依頼に添える糸。`also` は他人の entry（招く側の invite など）。"
+  [c & also]
+  (let [all (cons @c (map deref also))]
+    {:head (:head @c)
+     :blocks (into {} (for [m all [cid b] (:blocks m)] [cid (b64url-bytes b)]))
+     :sigs (into {} (for [m all [cid sig] (:sigs m)] [cid sig]))}))
+
+(defn world
+  "招く側と招かれる側、招く側だけが許可リストに載った env、そして invite。
+
+  -> Promise<{:env :inviter :me :invite}>"
+  [{:keys [inboxes] :or {inboxes 1}} & over]
+  (-> (js/Promise.all #js [(client) (client)])
+      (.then (fn [arr]
+               (let [[inviter me] (vec arr)
+                     e (apply env :RELAY_INVITER_ROOTS (:did @inviter) over)
+                     now (.now js/Date)]
+                 (.then (append! inviter {"type" "invite/issue" "at" now
+                                          "invitee" (:did @me) "inboxes" inboxes
+                                          "expires" (+ now 3600000)})
+                        (fn [invite] {:env e :inviter inviter :me me :invite invite})))))))
+
+(defn open-inbox
+  "inbox/open を積んで POST /v1/inboxes。-> Promise<Response>"
+  [{:keys [env inviter me invite]} origin]
   (let [{:keys [pub]} (x25519/generate-keypair)]
-    (worker/handle-fetch
-     (request :post "/v1/inboxes" :body (cond-> {:root "did:key:z6MkOwner"
-                                             :pub (eseal/b64url pub)
-                                             :origin origin}
-                                      invite (assoc :invite invite)))
-     env)))
+    (.then (append! me {"type" "inbox/open" "at" (.now js/Date) "invite" invite})
+           (fn [_]
+             (worker/handle-fetch
+              (request :post "/v1/inboxes" :body {:root (:did @me)
+                                                  :pub (eseal/b64url pub)
+                                                  :origin origin
+                                                  :ito (ito-body me inviter)})
+              env)))))
+
+(defn send-body
+  "mail/send を積み、送信の本文に糸を添える。-> Promise<body>"
+  [me body]
+  (.then (append! me {"type" "mail/send" "at" (.now js/Date)
+                      "to" (vec (concat (:to body) (:cc body)))})
+         (fn [_] (assoc body :ito (ito-body me)))))

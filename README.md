@@ -35,6 +35,42 @@ POST /v1/inboxes/{inbox}/messages ─> persona が From を決める ─> Resend
 request）、`kotoba-lang/envelope`（封）、`org-ietf-mime`（MIME）、
 `kotoba-lang/word-id`（読み上げられる 4 語）。
 
+## 予算は各 root の糸で数える（サーバに台帳を置かない）
+
+箱を開く・送るたびに、root は自分の**糸**（`kotoba-lang/chain` の commit 連鎖。
+1 entry = 1 commit、`actor` が root の DID、`prev` が 1 つ前）に entry を 1 つ
+積み、その CID を did:key で署名して依頼に添える（`mail-relay.ito`、
+ADR-2610101117 の 3）。
+
+```text
+"ito": {"head":   "<いちばん新しい entry の CID>",
+        "blocks": {"<cid>": "<dag-cbor の base64url>", …},
+        "sigs":   {"<cid>": "<Ed25519 署名の base64url>", …}}
+
+署名する文字列: "mail-relay.ito.v1\n" + cid
+
+entry の state:
+  {"type" "invite/issue" "at" ms "invitee" did "inboxes" n "expires" ms}   招く側の糸
+  {"type" "inbox/open"   "at" ms "invite" <invite/issue の CID>}            開く側の糸
+  {"type" "mail/send"    "at" ms "to" [address …]}                         送る側の糸
+```
+
+relay は糸を検証し、規則を最初から再生して判断する。**台帳は持たない。**
+
+- **invite** は招く側（`RELAY_INVITER_ROOTS` に載った DID。空なら誰も招けない）が
+  自分の糸に積んだ `invite/issue`。何回使ったかは、招かれた側の糸にある
+  `inbox/open` を数えて決まる。
+- **送信**は、直近 24 時間に**初めて連絡した相手**の数で上限をかける（既定 20）。
+  前に送った相手には何度送っても数えない。1 通の宛先は 10 まで。entry の宛先と
+  実際の宛先が違えば断る。
+- relay が覚えるのは**最後に見た head** だけ（R2 `ito/<did>`）。同じ head をもう
+  一度出すと `stale-head` で断る —— 1 つの entry で 2 回は出せない。
+- **分岐**（同じ位置に別々の entry を 2 つ署名した）を見つけたら、2 つの署名を
+  確かめて warrant を保管し（R2 `warrant/<did>`）、その root の開設も送信も
+  止める。warrant は `GET /v1/ito/{root}` で公開され、他の relay が読める。
+- 断られた entry を relay は見ていないので、client はそれを捨てて前の head から
+  積み直してよい。見ていない entry は分岐の証拠にならない。
+
 ## なぜ鍵ではなく root で認可するのか
 
 2026-08-21、AgentMail 互換の受信箱を作り、返ってきた `account_key` を保管し
@@ -101,15 +137,15 @@ dispatch も公開文書（`GET /v1/routes`）もここから出る。
 **表の op 集合と handler の鍵集合が等しい**ことを主張する。
 
 ```
-POST   /v1/inboxes                        :none  入場（root と pub と invite が要る）
-POST   /v1/invites                        :inviter ← invite の発行（許可リストの DID の署名）
+POST   /v1/inboxes                        :none  入場（root・pub・糸。糸の head が invite を指す）
+GET    /v1/ito/{root}                     :none  ← この relay が見た糸の head と warrant
 GET    /v1/inboxes/{inbox}                :key
 DELETE /v1/inboxes/{inbox}                :root  ← 解放経路
 POST   /v1/inboxes/{inbox}/keys/rotate    :root  ← 鍵の回復
 GET    /v1/inboxes/{inbox}/messages       :key
 GET    /v1/inboxes/{inbox}/messages/{msg} :key   index + 封じた chunk + CID
 GET    /v1/inboxes/{inbox}/threads        :key   ← 501。理由は下
-POST   /v1/inboxes/{inbox}/messages       :key   送信（persona → mailer → Resend）
+POST   /v1/inboxes/{inbox}/messages       :key   送信（糸で予算 → persona → mailer → Resend）
 POST   /v1/inboxes/{inbox}/personas       :key   相手ごとの顔
 DELETE /v1/personas/{address}             :key   その 1 本だけ止める
 GET    /v1/personas/{address}/senders     :key   誰から来たか = 漏洩の帰責
@@ -163,7 +199,7 @@ Worker は CLJS で動くので、JVM で通ることは証拠にならない。
 判断の層は `.cljc` なので**同じテストが両方で走る**。
 
 - JVM: 45 tests / 199 assertions
-- CLJS: 68 tests / 316 assertions（`seal_test` / `resend_test` / `worker_test` は
+- CLJS: 73 tests / 330 assertions（`seal_test` / `resend_test` / `worker_test` は
   CLJS のみ —— Web Crypto に同期 API が無い）
 
 `worker_test.cljs` は Cloudflare の binding だけを偽物にして、開く→顔を発行→
@@ -199,13 +235,19 @@ npx wrangler deploy
 - **デプロイ**。`relay.itonami.cloud` は未解決のまま。上の 6 つが要る。
 - **到達性**（SPF / DKIM / DMARC・レピュテーション）。外部に売るならここが
   開発の本体。
-- **入場の濫用対策のうち invite 以外**。`POST /v1/inboxes` は invite が要る
-  （ADR-2610101117）。invite を発行できるのは `RELAY_INVITER_ROOTS`（カンマ区切りの
-  DID）に載った root だけで、**空なら誰も発行できない**。root ごとの予算・初めての
-  相手の上限・PoW・評判はまだ。invite の `uses-left` も KV なので同時使用は best-effort。
+- **relay をまたいだ分岐の検出**。各 relay は自分が見た head しか知らない。
+  別の relay に古い位置から分岐した糸を見せると、両方の relay が head を
+  突き合わせるまで見つからない。`GET /v1/ito/{root}` はそのための面だが、
+  relay どうしが実際に読み合う経路（ADR-2610082200 の 布）はまだ無い。
+- **最後に見た head の保管**は R2。消えても正しさは壊れないが、その relay で
+  古い head を出し直される余地が増える。
+- **PoW・評判・招いた側の予算を減らすこと**はまだ。返信（相手から先に来た）を
+  初めての相手として数えないことも、まだ（今は糸に無い相手は全部初めて）。
 - **origin あたりの枠は best-effort**。registry を KV に置いており、KV は結果
-  整合なので、同一 origin から同時に 2 本開くと両方通りうる。厳密にするには
-  R2 の条件付き put か Durable Object が要る。濫用対策を入れる段で詰める。
+  整合なので、同一 origin から同時に 2 本開くと両方通りうる。origin は依頼の
+  本文の値なので、枠そのものが入場の制限にはならない（入場を絞るのは糸と
+  invite）。registry も糸の entry から再構成できる形に移す（ADR-2610101117）。
+  特定の基盤の直列化器（Durable Object など）には依存させない。
 - **添付の大きい 1 通**。`GET .../messages/{msg}` は封じた chunk を base64 で
   応答に載せる。数 KB のメールなら問題ないが、25 MiB の添付には向かない ——
   chunk を個別に引く route が要る。
