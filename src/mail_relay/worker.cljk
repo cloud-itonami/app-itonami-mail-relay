@@ -49,6 +49,8 @@
             [mail-relay.authz :as authz]
             [mail-relay.inbound :as inbound]
             [mail-relay.ito :as ito]
+            [nuno.core :as nuno]
+            [sha2.core :as sha2]
             [mail-relay.resend :as resend]
             [mail-relay.root-auth :as root-auth]
             [mail-relay.seal :as seal]
@@ -345,31 +347,106 @@
                        (some false? rs) :mail-relay.ito/bad-signature
                        :else nil))))))
 
-(defn- record-fork!
-  "分岐を見つけた。2 つの entry の署名が両方とも本人のものなら warrant を
-  保管して断る。署名が確かめられなければ、ただの壊れた依頼として断る
-  （他人が作った偽の分岐で root を止めさせない）。"
+(defn- make-warrant!
+  "分岐から warrant を作って保管する。2 つの entry の署名が両方とも本人の
+  ものでなければ作らない（他人が作った偽の分岐で root を止めさせない）。
+  -> Promise<{:warrant w} | {:bad 理由}>"
   [^js env did get-fn seen head sigs blocks]
   (let [ev (ito/fork-evidence get-fn seen head)
         a (:mail-relay.ito/a ev)
         b (:mail-relay.ito/b ev)]
     (if-not ev
-      (js/Promise.resolve (ito-fail :mail-relay.ito/broken-chain))
+      (js/Promise.resolve {:bad :mail-relay.ito/broken-chain})
       (-> (verify-signatures [{:did did :cid a :message (ito/signing-message a)}
                               {:did did :cid b :message (ito/signing-message b)}]
                              sigs)
           (.then (fn [bad]
                    (if bad
-                     (ito-fail bad)
+                     {:bad bad}
                      (let [w {:actor did :seq (:mail-relay.ito/seq ev) :a a :b b
                               :sigs {a (get sigs a) b (get sigs b)}
                               :blocks (encode-blocks blocks [a b])
                               :at (.now js/Date)}]
-                       (-> (r2-edn-put! env (warrant-key did) w)
-                           (.then (fn [_]
-                                    (ito-fail :mail-relay.ito/forked
-                                              {:warrant w
-                                               :basis "同じ位置に別々の entry を 2 つ署名した。この root は止まる"}))))))))))))
+                       (.then (r2-edn-put! env (warrant-key did) w)
+                              (fn [_] {:warrant w}))))))))))
+
+;; ------------------------------------------------------------ 布
+
+;; relay どうしの網（`nuno.core`、ADR-2610082200 の 布）。`RELAY_PEERS` が空なら
+;; 何もしない —— relay が 1 台なら今までと同じ。
+;;
+;; 網に流すものは全部、それ自体で正しさを示せる: head は root が署名した糸、
+;; warrant は root が署名した 2 つの entry。受け取った relay は送り手を信用
+;; せず、全部自分で確かめる。だから `/v1/nuno/ops` に認証は要らない。
+
+(defn- sha256-sync
+  "`kad.key/dht-key` は同期の SHA-256 を求める。Web Crypto は非同期なので、
+  keyspace の位置を決めるためだけに純粋実装を使う（秘密は扱わない）。"
+  [^js u8]
+  (js/Uint8Array.from (clj->js (sha2/sha256 (array-seq u8)))))
+
+(defn- self-id [^js env] (or (some-> (.-RELAY_SELF env) str not-empty) (str "https://" domain)))
+
+(defn- peer-ids [^js env]
+  (vec (remove #{(self-id env)} (ito/parse-inviters (.-RELAY_PEERS env)))))
+
+(defn- nuno-node [^js env]
+  (nuno/node {:id (self-id env) :peers (peer-ids env) :sha256 sha256-sync}))
+
+(defn- op->wire [o]
+  {:kind (name (:nuno/kind o)) :basis (:nuno/basis o) :id (:nuno/id o)
+   :payload (:nuno/payload o)})
+
+(defn- wire->op [m]
+  (nuno/op (keyword (str (:kind m))) (some-> (:basis m) str) (some-> (:id m) str) (:payload m)))
+
+(defn- head-op [did head blocks sigs cids]
+  (nuno/op :head did head {:head head
+                           :blocks (encode-blocks blocks cids)
+                           :sigs (select-keys sigs cids)}))
+
+(defn- warrant-op [w]
+  (nuno/op :warrant (:actor w) (str "warrant:" (:actor w) ":" (str/join ":" (sort [(:a w) (:b w)])))
+           w))
+
+(defn- send-ops!
+  "`[[宛先 op] …]` を配る。自分宛ては落とす（自分はもう保持している）。
+  届かない相手は記録だけして先へ進む —— 網の 1 台が落ちていても依頼は止めない。"
+  [^js env out]
+  (let [f (or (.-RELAY_FETCH env) js/fetch)
+        me (self-id env)]
+    (js/Promise.all
+     (clj->js
+      (for [[to o] out :when (not= to me)]
+        (-> (f (str to "/v1/nuno/ops")
+               #js {:method "POST"
+                    :headers #js {"content-type" "application/json"}
+                    :body (js/JSON.stringify (clj->js {:from me :op (op->wire o)}))})
+            (.catch (fn [e] (js/console.error "nuno: send failed" to (.-message e)) nil))))))))
+
+(defn- publish-head! [^js env did head blocks sigs cids]
+  (if (empty? (peer-ids env))
+    (js/Promise.resolve nil)
+    (send-ops! env (:nuno/out (nuno/publish (nuno-node env) (head-op did head blocks sigs cids))))))
+
+(defn- flood-warrant! [^js env w from]
+  (if (empty? (peer-ids env))
+    (js/Promise.resolve nil)
+    (let [o (warrant-op w)]
+      (send-ops! env (:nuno/out (nuno/settle (nuno-node env) o from {:verdict :valid}))))))
+
+(defn- record-fork!
+  "分岐を見つけた。warrant を作れれば保管して網に流し、断る。"
+  [^js env did get-fn seen head sigs blocks]
+  (-> (make-warrant! env did get-fn seen head sigs blocks)
+      (.then (fn [{:keys [warrant bad]}]
+               (if bad
+                 (ito-fail bad)
+                 (.then (flood-warrant! env warrant nil)
+                        (fn [_]
+                          (ito-fail :mail-relay.ito/forked
+                                    {:warrant warrant
+                                     :basis "同じ位置に別々の entry を 2 つ署名した。この root は止まる"}))))))))
 
 (defn- admit-ito!
   "root の糸を読み、検証し、`decide` を当てはめる。
@@ -419,6 +496,8 @@
                                                      {:head head
                                                       :blocks (encode-blocks blocks cids)
                                                       :sigs (select-keys sigs cids)})
+                                        ;; 進めた head を authority に配る。
+                                        (.then (fn [_] (publish-head! env did head blocks sigs cids)))
                                         (.then (fn [_] {:ok d}))))))))))))))))))))
 
 (defn- response? [x] (instance? js/Response x))
@@ -646,6 +725,91 @@
                               (fail 502 :send-failed {:provider (name (:mail-relay/provider d))
                                                       :detail (:error result)}))))))))))))
 
+(defn- receive-head!
+  "網から届いた head。この relay が最後に見た head と比べ、伸びていれば保持、
+  同じか古ければ無視、分岐していれば warrant を作って網に流す。"
+  [^js env from o]
+  (let [did (:nuno/basis o)
+        p (:nuno/payload o)]
+    (-> (r2-edn-get env (ito-key did))
+        (.then
+         (fn [rec]
+           (let [blocks (merge (decode-blocks (:blocks rec)) (decode-blocks (:blocks p)))
+                 sigs (merge (:sigs rec) (string-keys (:sigs p)))
+                 get-fn #(get blocks %)
+                 head (some-> (:head p) str not-empty)
+                 seen (:head rec)
+                 r (ito/read-chain get-fn head did)]
+             (if (not= :read (:mail-relay/decision r))
+               (json 200 {:ok true :verdict "ignore" :why (name (:mail-relay/reason r))})
+               (let [entries (:mail-relay.ito/entries r)]
+                 (case (ito/relation get-fn seen head)
+                   (:same :stale) (json 200 {:ok true :verdict "ignore" :why "not-newer"})
+                   :fork (-> (make-warrant! env did get-fn seen head sigs blocks)
+                             (.then (fn [{:keys [warrant bad]}]
+                                      (if bad
+                                        (json 200 {:ok true :verdict "ignore" :why (name bad)})
+                                        (.then (flood-warrant! env warrant nil)
+                                               (fn [_] (json 200 {:ok true :verdict "conflict"})))))))
+                   (-> (verify-signatures
+                        (ito/signatures-to-check (ito/new-entries entries seen) [])
+                        sigs)
+                       (.then (fn [bad]
+                                (if bad
+                                  (json 200 {:ok true :verdict "ignore" :why (name bad)})
+                                  (let [cids (map :cid entries)]
+                                    (.then (r2-edn-put! env (ito-key did)
+                                                        {:head head
+                                                         :blocks (encode-blocks blocks cids)
+                                                         :sigs (select-keys sigs cids)})
+                                           (fn [_] (json 202 {:ok true :verdict "hold"})))))))))))))))))
+
+(defn- receive-warrant!
+  "網から届いた warrant。証拠を**自分で**確かめる: 2 つの entry が block から
+  読め、両方とも basis の entry で、同じ seq に立ち、別物で、両方の署名が
+  本人のもの。本物なら保管して、送ってきた相手以外へ流す。偽物は流さない。"
+  [^js env from o]
+  (let [w (:nuno/payload o)
+        did (:nuno/basis o)
+        blocks (decode-blocks (:blocks w))
+        sigs (string-keys (:sigs w))
+        get-fn #(get blocks %)
+        a (some-> (:a w) str)
+        b (some-> (:b w) str)
+        ea (when a (ito/entry-at get-fn a))
+        eb (when b (ito/entry-at get-fn b))]
+    (if-not (and ea eb (not= a b)
+                 (= did (:actor ea) (:actor eb))
+                 (= (:seq ea) (:seq eb)))
+      (js/Promise.resolve (json 200 {:ok true :verdict "invalid"}))
+      (-> (verify-signatures [{:did did :cid a :message (ito/signing-message a)}
+                              {:did did :cid b :message (ito/signing-message b)}]
+                             sigs)
+          (.then (fn [bad]
+                   (if bad
+                     (json 200 {:ok true :verdict "invalid" :why (name bad)})
+                     (let [stored {:actor did :seq (:seq ea) :a a :b b :sigs sigs
+                                   :blocks (:blocks w) :at (.now js/Date)
+                                   :via from}]
+                       (-> (r2-edn-put! env (warrant-key did) stored)
+                           (.then (fn [_] (flood-warrant! env stored from)))
+                           (.then (fn [_] (json 202 {:ok true :verdict "valid"}))))))))))))
+
+(defn- op-nuno-receive [^js env body]
+  (let [o (wire->op (:op body))
+        from (some-> (:from body) str not-empty)
+        did (:nuno/basis o)]
+    (-> (js/Promise.all #js [(r2-edn-get env (warrant-key (str did)))])
+        (.then
+         (fn [arr]
+           (let [w (first (vec arr))
+                 n (cond-> (nuno-node env) w (assoc-in [:nuno/warrants did] w))
+                 i (nuno/inspect n o)]
+             (case (:nuno/action i)
+               :ignore (json 200 {:ok true :verdict "ignore" :why (name (:nuno/why i))})
+               :judge-head (receive-head! env from o)
+               :judge-warrant (receive-warrant! env from o))))))))
+
 (defn- op-ito-get
   "この relay が最後に見た糸の head と、あれば warrant。relay どうしが互いの
   見たものを読み合い、relay をまたいだ分岐を見つけるための面。"
@@ -750,7 +914,8 @@
                                            (inbound/normalize-address (:address params)))))
    :webhook/create  (fn [{:keys [env inbox-state inbox body]}]
                       (op-webhook-create env inbox-state inbox body))
-   :ito/get         (fn [{:keys [env params]}] (op-ito-get env (:root params)))})
+   :ito/get         (fn [{:keys [env params]}] (op-ito-get env (:root params)))
+   :nuno/receive    (fn [{:keys [env body]}] (op-nuno-receive env body))})
 
 (defn- run-op [ctx]
   (if-let [f (get ops (get-in ctx [:route :op]))]

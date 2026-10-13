@@ -231,3 +231,28 @@
   (.then (append! me {"type" "mail/send" "at" (.now js/Date)
                       "to" (vec (concat (:to body) (:cc body)))})
          (fn [_] (assoc body :ito (ito-body me)))))
+
+;; ------------------------------------------------------------- 布（relay の網）
+
+(defn relays
+  "同じプロセスの中に relay を `urls` の数だけ立てる。それぞれ自分の KV と R2 を
+  持ち、`RELAY_FETCH` は宛先の URL の relay の `handle-fetch` に渡す —— HTTP の
+  代わりに関数呼び出しで配るだけで、受け取った側の判断は本物。
+
+  -> {url env}"
+  [urls & over]
+  (let [envs (atom {})
+        route (fn [url ^js init]
+                (let [base (some #(when (str/starts-with? (str url) %) %) (keys @envs))]
+                  (if-let [e (get @envs base)]
+                    (worker/handle-fetch (js/Request. url init) e)
+                    (js/Promise.reject (js/Error. (str "no relay at " url))))))]
+    (doseq [u urls]
+      (swap! envs assoc u (apply env :RELAY_SELF u
+                                 :RELAY_PEERS (str/join "," urls)
+                                 :RELAY_FETCH route
+                                 over)))
+    @envs))
+
+(defn set-all! [envs k v]
+  (doseq [e (vals envs)] (aset e (name k) v)))

@@ -415,3 +415,160 @@
                        "なぜサーバでは組めないかを言わずに 501 を返さない")
                    (done)))
           (.catch (fn [e] (is false (str "threw: " (.-message e))) (done)))))))
+
+;; ------------------------------------------------------------- 布（relay の網）
+
+(def urls ["https://r1.relay.test" "https://r2.relay.test" "https://r3.relay.test"])
+
+(defn- ito-at [envs url did]
+  (-> (worker/handle-fetch (req :get (str "/v1/ito/" did)) (get envs url))
+      (.then json-of)
+      (.then ->clj)))
+
+(defn- relay-world
+  "3 台の relay と、そこに箱を開ける利用者。-> Promise<{:envs :w}>"
+  [inboxes]
+  (let [envs (fakes/relays urls :RESEND_API_KEY "re_test" :RESEND_FETCH (fakes/resend-send-ok))]
+    (.then (world {:inboxes inboxes})
+           (fn [w]
+             (fakes/set-all! envs :RELAY_INVITER_ROOTS (:did @(:inviter w)))
+             {:envs envs :w w}))))
+
+(deftest heads-spread-across-relays
+  (async done
+    (let [st (atom {})]
+      (-> (relay-world 3)
+          (.then (fn [m] (reset! st m)
+                   (open-inbox (assoc (:w m) :env (get (:envs m) (first urls))) "203.0.113.80")))
+          (.then (fn [^js r]
+                   (is (= 201 (.-status r)))
+                   (open-inbox (assoc (:w @st) :env (get (:envs @st) (second urls))) "203.0.113.81")))
+          (.then (fn [^js r]
+                   (is (= 201 (.-status r)) "r1 で開けた続きを r2 で積める")
+                   (js/Promise.all (clj->js (map #(ito-at (:envs @st) % (:did @(:me (:w @st)))) urls)))))
+          (.then (fn [arr]
+                   (let [heads (map :head (vec arr))
+                         me-head (:head @(:me (:w @st)))]
+                     (is (every? #(= me-head %) heads) "3 台とも最新の head を持つ")
+                     (is (not-any? :warrant (vec arr)) "正直な糸には warrant が無い"))
+                   (done)))
+          (.catch (fn [e] (is false (str "threw: " (.-message e) "\n" (.-stack e))) (done)))))))
+
+(deftest a-fork-shown-to-two-relays-stops-the-root-on-every-relay
+  ;; ADR-2610082200 P4 の合否条件を relay 3 台で: 糸の分岐の warrant が全台に
+  ;; 届き、その網で作者が拒否される。
+  (async done
+    (let [st (atom {})
+          at (fn [i] (assoc (:w @st) :env (get (:envs @st) (nth urls i))))]
+      (-> (relay-world 3)
+          (.then (fn [m] (reset! st m) (box! (at 0) "203.0.113.90")))
+          (.then (fn [b1] (swap! st assoc :b1 b1) (box! (at 1) "203.0.113.91")))
+          (.then (fn [b2]
+                   (swap! st assoc :b2 b2 :fork-point (:head @(:me (:w @st))))
+                   (send! (at 0) (:b1 @st) ["x@example.com"])))
+          (.then (fn [^js r]
+                   (is (= 202 (.-status r)) "r1 で 1 通出る")
+                   ;; 同じ位置から別の entry を署名して、今度は r2 に見せる
+                   (swap! (:me (:w @st)) assoc :head (:fork-point @st))
+                   (send! (at 1) (:b2 @st) ["y@example.com"])))
+          (.then (fn [^js r]
+                   (is (= 403 (.-status r)) "r2 は r1 から届いた head と比べて分岐に気づく")
+                   (js/Promise.all (clj->js (map #(ito-at (:envs @st) % (:did @(:me (:w @st)))) urls)))))
+          (.then (fn [arr]
+                   (is (every? :warrant (vec arr)) "warrant は 3 台すべてに届く")
+                   (box! (at 2) "203.0.113.92")))
+          (.then (fn [b3]
+                   (is (nil? (:inbox b3)) "まだ箱の無い r3 でも開けない")
+                   (done)))
+          (.catch (fn [e] (is false (str "threw: " (.-message e) "\n" (.-stack e))) (done)))))))
+
+(deftest a-forged-warrant-from-the-net-is-not-kept-or-spread
+  (async done
+    (let [st (atom {})]
+      (-> (relay-world 3)
+          (.then (fn [m]
+                   (reset! st m)
+                   ;; 招く側の鍵で、招かれた側の名前の 2 つの entry を作る
+                   (let [me-did (:did @(:me (:w m)))
+                         forger (:inviter (:w m))]
+                     (-> (js/Promise.all
+                          #js [(fakes/append! forger {"type" "mail/send" "at" (.now js/Date) "to" ["a@x.test"]} nil)
+                               (fakes/append! forger {"type" "mail/send" "at" (.now js/Date) "to" ["b@x.test"]} nil)])
+                         (.then (fn [arr]
+                                  (let [[a b] (vec arr)]
+                                    (worker/handle-fetch
+                                     (req :post "/v1/nuno/ops"
+                                          :body {:from "https://evil.test"
+                                                 :op {:kind "warrant" :basis me-did :id "w:forged"
+                                                      :payload {:actor me-did :seq 0 :a a :b b
+                                                                :sigs (select-keys (:sigs @forger) [a b])
+                                                                :blocks (select-keys (:blocks (fakes/ito-body forger)) [a b])}}})
+                                     (get (:envs m) (first urls))))))))))
+          (.then (fn [^js r] (json-of r)))
+          (.then (fn [^js b]
+                   (is (= "invalid" (.-verdict b)) "他人の entry を証拠にした warrant は偽物")
+                   (js/Promise.all (clj->js (map #(ito-at (:envs @st) % (:did @(:me (:w @st)))) urls)))))
+          (.then (fn [arr]
+                   (is (not-any? :warrant (vec arr)) "どの relay も保管せず、流してもいない")
+                   (done)))
+          (.catch (fn [e] (is false (str "threw: " (.-message e) "\n" (.-stack e))) (done)))))))
+
+
+(deftest a-warrant-with-entries-in-the-victims-name-but-the-wrong-key-is-rejected
+  ;; actor は合っているが、署名が本人の鍵ではない証拠。署名を確かめなければ、
+  ;; DID を知るだけで誰でも他人を網から締め出せてしまう。
+  (async done
+    (let [st (atom {})]
+      (-> (relay-world 3)
+          (.then (fn [m]
+                   (reset! st m)
+                   (let [me-did (:did @(:me (:w m)))
+                         impostor (atom {:did me-did :kp (:kp @(:inviter (:w m)))
+                                         :blocks {} :sigs {} :head nil})]
+                     (-> (fakes/append! impostor {"type" "mail/send" "at" (.now js/Date) "to" ["a@x.test"]} nil)
+                         (.then (fn [a] (.then (fakes/append! impostor {"type" "mail/send" "at" (.now js/Date)
+                                                                         "to" ["b@x.test"]} nil)
+                                               (fn [b] [a b]))))
+                         (.then (fn [[a b]]
+                                  (let [body (fakes/ito-body impostor)]
+                                    (worker/handle-fetch
+                                     (req :post "/v1/nuno/ops"
+                                          :body {:from "https://evil.test"
+                                                 :op {:kind "warrant" :basis me-did :id "w:impostor"
+                                                      :payload {:actor me-did :seq 0 :a a :b b
+                                                                :sigs (select-keys (:sigs body) [a b])
+                                                                :blocks (select-keys (:blocks body) [a b])}}})
+                                     (get (:envs m) (first urls))))))))))
+          (.then json-of)
+          (.then (fn [^js b]
+                   (is (= "invalid" (.-verdict b)))
+                   (js/Promise.all (clj->js (map #(ito-at (:envs @st) % (:did @(:me (:w @st)))) urls)))))
+          (.then (fn [arr] (is (not-any? :warrant (vec arr))) (done)))
+          (.catch (fn [e] (is false (str "threw: " (.-message e))) (done)))))))
+
+(deftest a-head-from-the-net-with-a-bad-signature-is-not-held
+  (async done
+    (let [st (atom {})]
+      (-> (relay-world 3)
+          (.then (fn [m]
+                   (reset! st m)
+                   (let [me (:me (:w m))]
+                     (.then (fakes/append! me {"type" "mail/send" "at" (.now js/Date) "to" ["a@x.test"]})
+                            (fn [cid]
+                              ;; 署名を別の鍵のものに差し替える
+                              (.then (sign-b64 (:kp @(:inviter (:w m))) (ito/signing-message cid))
+                                     (fn [forged]
+                                       (swap! me assoc-in [:sigs cid] forged)
+                                       (let [body (fakes/ito-body me)]
+                                         (worker/handle-fetch
+                                          (req :post "/v1/nuno/ops"
+                                               :body {:from "https://evil.test"
+                                                      :op {:kind "head" :basis (:did @me) :id cid
+                                                           :payload body}})
+                                          (get (:envs m) (first urls)))))))))))
+          (.then json-of)
+          (.then (fn [^js b]
+                   (is (= "ignore" (.-verdict b)))
+                   (ito-at (:envs @st) (first urls) (:did @(:me (:w @st))))))
+          (.then (fn [m] (is (nil? (:head m)) "保持していない") (done)))
+          (.catch (fn [e] (is false (str "threw: " (.-message e))) (done)))))))
