@@ -226,11 +226,28 @@
               env)))))
 
 (defn send-body
-  "mail/send を積み、送信の本文に糸を添える。-> Promise<body>"
+  "mail/send を積み、送信の本文に糸を添える。`:receipts`（relay が出した
+  receipt。返信の証拠）があれば entry に入れる。-> Promise<body>"
   [me body]
-  (.then (append! me {"type" "mail/send" "at" (.now js/Date)
-                      "to" (vec (concat (:to body) (:cc body)))})
-         (fn [_] (assoc body :ito (ito-body me)))))
+  (.then (append! me (cond-> {"type" "mail/send" "at" (.now js/Date)
+                              "to" (vec (concat (:to body) (:cc body)))}
+                       (seq (:receipts body))
+                       (assoc "receipts" (mapv (fn [r] (into {} (map (fn [[k v]] [(name k) v])) r))
+                                               (:receipts body)))))
+         (fn [_] (assoc (dissoc body :receipts) :ito (ito-body me)))))
+
+(defn relay-signing-key
+  "relay の Ed25519 鍵を作る。-> Promise<{:pkcs8 b64url :did did:key}>"
+  []
+  (-> (js/crypto.subtle.generateKey #js {:name "Ed25519"} true #js ["sign" "verify"])
+      (.then (fn [^js kp]
+               (js/Promise.all #js [(js/crypto.subtle.exportKey "pkcs8" (.-privateKey kp))
+                                    (js/crypto.subtle.exportKey "raw" (.-publicKey kp))])))
+      (.then (fn [arr]
+               (let [[pk pub] (vec arr)]
+                 {:pkcs8 (eseal/b64url (js/Uint8Array. pk))
+                  :did (str "did:key:z" (b58-encode (concat [0xed 0x01]
+                                                            (array-seq (js/Uint8Array. pub)))))})))))
 
 ;; ------------------------------------------------------------- 布（relay の網）
 

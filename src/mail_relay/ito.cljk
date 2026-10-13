@@ -14,7 +14,16 @@
 
       {\"type\" \"invite/issue\" \"at\" ms \"invitee\" did \"inboxes\" n \"expires\" ms}
       {\"type\" \"inbox/open\"   \"at\" ms \"invite\" <招く側の invite/issue の CID>}
-      {\"type\" \"mail/send\"    \"at\" ms \"to\" [address …]}
+      {\"type\" \"mail/send\"    \"at\" ms \"to\" [address …] \"receipts\" [receipt …]}
+
+  ## 返信は初めての相手として数えない
+
+  relay は受けた 1 通ごとに **receipt** を出す: 『この差出人が、この root に、
+  この CID の 1 通を送った』を relay 自身の did:key で署名したもの
+  （`receipt-message`）。root はその人への返信の mail/send entry に receipt を
+  入れる。receipt の差出人は初めての相手として数えない。receipt を偽れるのは
+  relay の鍵を持つ者だけで、どの relay も署名と、信頼する relay の DID の
+  一覧だけから同じ答えに至る。
 
   署名は commit の中に入れられない（署名が自分自身の CID を覆えない）ので、
   `signing-message` を root の did:key で署名したものを、CID ごとに別に運ぶ。
@@ -76,6 +85,17 @@
     #{}
     (->> (str/split (str configured) #",") (map str/trim) (remove str/blank?) set)))
 
+(def receipt-schema "mail-relay.receipt.v1")
+
+(defn receipt-message
+  "relay が receipt に署名する文字列。root・差出人・宛先・CID・時刻を全部覆う
+  —— どれか 1 つでも落とすと、別の root や別の相手への返信に付け替えられる。"
+  [r]
+  (str receipt-schema "\n" (get r "root") "\n" (get r "from") "\n" (get r "to")
+       "\n" (get r "msg") "\n" (get r "at")))
+
+(defn receipts-of [entry] (vec (get-in entry [:state "receipts"])))
+
 (defn normalize-address [a]
   (some-> a str str/trim str/lower not-empty))
 
@@ -91,6 +111,10 @@
       (and (= "mail/send" t)
            (not (and (sequential? (get state "to")) (seq (get state "to")))))
       :mail-relay.ito/send-without-recipients
+      (and (contains? state "receipts")
+           (not (and (sequential? (get state "receipts"))
+                     (every? map? (get state "receipts")))))
+      :mail-relay.ito/malformed-receipts
       (and (= "inbox/open" t) (str/blank? (str (get state "invite"))))
       :mail-relay.ito/open-without-invite
       (and (= "invite/issue" t)
@@ -240,25 +264,54 @@
       :else
       {:mail-relay/decision :open :mail-relay/invited-by (:actor invite)})))
 
+(defn- replied-to
+  "その entry の receipt が示す、先に書いてきた相手。"
+  [e]
+  (set (keep #(normalize-address (get % "from")) (receipts-of e))))
+
 (defn first-contacts
-  "各 mail/send entry について、それより前の糸に一度も出てこない宛先。
-  -> [[entry #{address …}] …]"
+  "各 mail/send entry について、それより前の糸に一度も出てこず、receipt で
+  先に書いてきたことも示されていない宛先。-> [[entry #{address …}] …]"
   [entries]
   (loop [es entries seen #{} acc []]
     (if-let [e (first es)]
       (if (= "mail/send" (get-in e [:state "type"]))
         (let [to (set (keep normalize-address (get-in e [:state "to"])))
-              fresh (into #{} (remove seen) to)]
+              fresh (into #{} (remove (into seen (replied-to e))) to)]
           (recur (rest es) (into seen to) (conj acc [e fresh])))
         (recur (rest es) seen acc))
       acc)))
+
+(defn receipt-problem
+  "糸の receipt の、署名以外の検査。`relays` は信頼する relay の DID の集合。"
+  [entries relays]
+  (let [rs (for [e entries r (receipts-of e)] [e r])]
+    (cond
+      (some (fn [[_ r]] (not (and (string? (get r "sig")) (string? (get r "relay"))
+                                  (string? (get r "from")) (integer? (get r "at")))))
+            rs)
+      :mail-relay.ito/malformed-receipts
+
+      (some (fn [[e r]] (not= (:actor e) (get r "root"))) rs)
+      :mail-relay.ito/receipt-for-someone-else
+
+      (some (fn [[_ r]] (not (contains? relays (get r "relay")))) rs)
+      :mail-relay.ito/untrusted-receipt
+
+      :else nil)))
+
+(defn receipts-to-check
+  "host が Ed25519 で確かめるべき receipt の署名。-> [{:did :message :sig} …]"
+  [entries]
+  (vec (for [e entries r (receipts-of e)]
+         {:did (get r "relay") :message (receipt-message r) :sig (get r "sig")})))
 
 (defn admit-send
   "糸の head が、この 1 通を出す entry として通るか。
 
   **通数ではなく、初めて連絡する相手の数に上限をかける。** 前に送ったことの
   ある相手への送信は数えない。窓の中で初めての相手が上限を超えたら断る。"
-  [entries {:keys [to now limits]}]
+  [entries {:keys [to now limits receipt-relays]}]
   (let [limits (merge default-limits limits)
         head (peek entries)
         st (:state head)
@@ -276,6 +329,9 @@
 
       (not (fresh-time? (get st "at") now limits))
       (refuse :mail-relay.ito/stale-entry-time)
+
+      (receipt-problem entries (set receipt-relays))
+      (refuse (receipt-problem entries (set receipt-relays)))
 
       (not= requested entry-to)
       (refuse :mail-relay.ito/recipients-do-not-match
@@ -334,4 +390,8 @@
    :mail-relay.ito/bad-signature 403
    :mail-relay.ito/stale-head 409
    :mail-relay.ito/forked 403
+   :mail-relay.ito/malformed-receipts 400
+   :mail-relay.ito/receipt-for-someone-else 403
+   :mail-relay.ito/untrusted-receipt 403
+   :mail-relay.ito/bad-receipt 403
    :mail-relay/origin-slot-taken 409})

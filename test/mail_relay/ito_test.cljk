@@ -7,6 +7,7 @@
   3. invite の使用回数は、招かれた側の糸を数えて決まる
   4. 分岐は証拠として取り出せる。古い head の出し直しは分岐とは別に扱う"
   (:require [kotoba.test :refer [deftest is testing]]
+            [kotoba.lang.text :as str]
             [mail-relay.ito :as ito]))
 
 (def alice "did:key:z6MkAlice")
@@ -162,3 +163,55 @@
     (testing "まだ確かめていない entry は seen より後だけ"
       (is (= [ahead] (mapv :cid (ito/new-entries (entries-of s ahead alice) left))))
       (is (= 3 (count (ito/new-entries (entries-of s ahead alice) nil)))))))
+
+(def relay "did:key:z6MkRelay")
+
+(defn- receipt [root from]
+  {"type" "mail/receipt" "root" root "from" from "to" "me@mail.test"
+   "msg" "bafkreiexample" "at" now "relay" relay "sig" "c2ln"})
+
+(deftest replies-are-not-first-contacts
+  (let [s (store)
+        limits {:mail-relay.ito/first-contacts-per-window 1}
+        opts {:now now :limits limits :receipt-relays #{relay}}
+        ;; 初めての相手 1 人で上限に達する
+        base (grow s alice nil [(send-st now "a@x.test")])]
+    (testing "先に書いてきた相手への返信は数えない"
+      (let [[c] (grow s alice (peek base)
+                      [(assoc (send-st now "stranger@y.test")
+                              "receipts" [(receipt alice "Stranger@Y.test")])])
+            d (ito/admit-send (entries-of s c alice) (assoc opts :to ["stranger@y.test"]))]
+        (is (= :send (:mail-relay/decision d)))
+        (is (= 1 (:mail-relay.ito/first-contacts-used d)))))
+
+    (testing "receipt があっても、書いてきた人以外への送信は数える"
+      (let [[c] (grow s alice (peek base)
+                      [(assoc (send-st now "other@y.test")
+                              "receipts" [(receipt alice "stranger@y.test")])])]
+        (is (= :mail-relay.ito/first-contact-budget-exhausted
+               (:mail-relay/reason (ito/admit-send (entries-of s c alice)
+                                                   (assoc opts :to ["other@y.test"])))))))
+
+    (testing "receipt が無ければ、同じ相手でも数える"
+      (let [[c] (grow s alice (peek base) [(send-st now "stranger@y.test")])]
+        (is (= :mail-relay.ito/first-contact-budget-exhausted
+               (:mail-relay/reason (ito/admit-send (entries-of s c alice)
+                                                   (assoc opts :to ["stranger@y.test"])))))))))
+
+(deftest receipts-must-come-from-a-trusted-relay-and-name-this-root
+  (let [s (store)
+        opts {:now now :to ["stranger@y.test"] :receipt-relays #{relay}}
+        with (fn [r] (let [[c] (grow s alice nil [(assoc (send-st now "stranger@y.test")
+                                                         "receipts" [r])])]
+                       (:mail-relay/reason (ito/admit-send (entries-of s c alice) opts))))]
+    (is (= :mail-relay.ito/untrusted-receipt
+           (with (assoc (receipt alice "stranger@y.test") "relay" "did:key:z6MkSomeRelay"))))
+    (is (= :mail-relay.ito/receipt-for-someone-else
+           (with (receipt bob "stranger@y.test")))
+        "他人宛ての receipt を自分の返信に使えない")
+    (is (= :mail-relay.ito/malformed-receipts
+           (with (dissoc (receipt alice "stranger@y.test") "sig"))))
+    (testing "署名の検査に回す文字列は root・差出人・宛先・CID・時刻を全部覆う"
+      (let [m (ito/receipt-message (receipt alice "stranger@y.test"))]
+        (is (every? #(str/includes? m %) [alice "stranger@y.test" "me@mail.test"
+                                          "bafkreiexample" (str now)]))))))
