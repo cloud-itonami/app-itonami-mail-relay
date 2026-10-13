@@ -63,6 +63,15 @@ relay は糸を検証し、規則を最初から再生して判断する。**台
 - **送信**は、直近 24 時間に**初めて連絡した相手**の数で上限をかける（既定 20）。
   前に送った相手には何度送っても数えない。1 通の宛先は 10 まで。entry の宛先と
   実際の宛先が違えば断る。
+- **返信**も数えない。relay は受けた 1 通ごとに **receipt**（『この差出人が、
+  この root に、この CID の 1 通を送った』を relay の did:key で署名したもの）を
+  出し、メッセージ一覧の `receipt` に載せる。返信の `mail/send` entry に
+  `"receipts" [receipt]` を入れると、その差出人は初めての相手として数えない。
+  receipt を偽れるのは relay の鍵を持つ者だけで、受け入れる relay の DID は
+  `RELAY_RECEIPT_DIDS` に並べる（自分の DID も入れる）。receipt は依頼で来ても、
+  布から来た head に入っていても、署名を確かめてから受け入れる。
+  relay の鍵は `RELAY_SIGNING_KEY`（Ed25519 の PKCS#8、base64url）。未設定なら
+  receipt を出さず、返信も初めての相手として数える。
 - relay が覚えるのは**最後に見た head** だけ（R2 `ito/<did>`）。同じ head をもう
   一度出すと `stale-head` で断る —— 1 つの entry で 2 回は出せない。
 - **分岐**（同じ位置に別々の entry を 2 つ署名した）を見つけたら、2 つの署名を
@@ -220,7 +229,7 @@ Worker は CLJS で動くので、JVM で通ることは証拠にならない。
 判断の層は `.cljc` なので**同じテストが両方で走る**。
 
 - JVM: 45 tests / 199 assertions
-- CLJS: 78 tests / 347 assertions（`seal_test` / `resend_test` / `worker_test` は
+- CLJS: 82 tests / 367 assertions（`seal_test` / `resend_test` / `worker_test` は
   CLJS のみ —— Web Crypto に同期 API が無い）
 
 `worker_test.cljs` は Cloudflare の binding だけを偽物にして、開く→顔を発行→
@@ -263,8 +272,8 @@ npx wrangler deploy
   持たない。
 - **最後に見た head の保管**は R2。消えても正しさは壊れないが、その relay で
   古い head を出し直される余地が増える。
-- **PoW・評判・招いた側の予算を減らすこと**はまだ。返信（相手から先に来た）を
-  初めての相手として数えないことも、まだ（今は糸に無い相手は全部初めて）。
+- **PoW・評判・招いた側の予算を減らすこと**はまだ。receipt に有効期限は無い
+  （一度書いてきた人への返信は、いつでも返信として扱う）。
 - **origin あたりの枠は best-effort**。registry を KV に置いており、KV は結果
   整合なので、同一 origin から同時に 2 本開くと両方通りうる。origin は依頼の
   本文の値なので、枠そのものが入場の制限にはならない（入場を絞るのは糸と

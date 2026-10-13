@@ -572,3 +572,118 @@
                    (ito-at (:envs @st) (first urls) (:did @(:me (:w @st))))))
           (.then (fn [m] (is (nil? (:head m)) "保持していない") (done)))
           (.catch (fn [e] (is false (str "threw: " (.-message e))) (done)))))))
+
+;; ------------------------------------------------------------- 返信と receipt
+
+(deftest a-reply-with-a-receipt-is-not-a-first-contact
+  (async done
+    (let [st (atom {})
+          cap (:mail-relay.ito/first-contacts-per-window ito/default-limits)
+          send-with (fn [to receipts]
+                      ;; 断られた entry は relay が見ていないので捨てて、前の head に戻す
+                      ;; （client が普通にすること）。
+                      (let [{:keys [w box]} @st
+                            before (:head @(:me w))]
+                        (-> (send-body (:me w) {:address (:address box) :to to
+                                                :subject "Re" :text "y" :receipts receipts})
+                            (.then (fn [body]
+                                     (worker/handle-fetch
+                                      (req :post (str "/v1/inboxes/" (:inbox box) "/messages")
+                                           :headers {"authorization" (str "Bearer " (:key box))}
+                                           :body body)
+                                      (:env w))))
+                            (.then (fn [^js r]
+                                     (when-not (.-ok r) (swap! (:me w) assoc :head before))
+                                     r)))))]
+      (-> (fakes/relay-signing-key)
+          (.then (fn [rk]
+                   (swap! st assoc :rk rk)
+                   (world {} :RESEND_API_KEY "re_test" :RESEND_FETCH (fakes/resend-send-ok)
+                          :RELAY_SIGNING_KEY (:pkcs8 rk) :RELAY_RECEIPT_DIDS (:did rk))))
+          (.then (fn [w] (swap! st assoc :w w) (box! w "203.0.113.100")))
+          (.then (fn [box]
+                   (swap! st assoc :box box)
+                   ;; 知らない人が先に書いてくる
+                   (worker/save-raw! (:env (:w @st))
+                                     {:to (:address box) :from "stranger@example.com"
+                                      :raw (message-to (:address box))
+                                      :received-at "2026-10-13T00:00:00Z"})))
+          (.then (fn [_]
+                   (worker/handle-fetch
+                    (req :get (str "/v1/inboxes/" (:inbox (:box @st)) "/messages")
+                         :headers {"authorization" (str "Bearer " (:key (:box @st)))})
+                    (:env (:w @st)))))
+          (.then json-of)
+          (.then (fn [^js b]
+                   (let [r (:receipt (first (:messages (->clj b))))]
+                     (swap! st assoc :receipt r)
+                     (is (= "stranger@example.com" (:from r)))
+                     (is (= (:did @(:me (:w @st))) (:root r)) "receipt は箱の root を名指す")
+                     (is (= (:did (:rk @st)) (:relay r)))
+                     ;; receipt は relay の鍵で本当に署名されている
+                     (root-auth/verify (:relay r) (:sig r)
+                                       (ito/receipt-message (into {} (map (fn [[k v]] [(name k) v])) r))))))
+          (.then (fn [ok?]
+                   (is (true? ok?) "receipt の署名が relay の did:key で検証できる")
+                   ;; 初めての相手で上限まで使い切る
+                   (reduce (fn [p i] (.then p (fn [_] (send-with [(str "p" i "@example.com")] nil))))
+                           (js/Promise.resolve nil) (range cap))))
+          (.then (fn [^js r]
+                   (is (= 202 (.-status r)))
+                   (send-with ["stranger@example.com"] [(:receipt @st)])))
+          (.then (fn [^js r]
+                   (is (= 202 (.-status r)) "上限を使い切っても、先に書いてきた人には返信できる")
+                   (send-with ["newbie@example.com"] [(:receipt @st)])))
+          (.then (fn [^js r]
+                   (is (= 429 (.-status r)) "receipt を付けても、書いてきた人以外は初めての相手")
+                   ;; receipt の差出人を書き換える（署名はもう合わない）
+                   (send-with ["mallory@example.com"]
+                              [(assoc (:receipt @st) :from "mallory@example.com")])))
+          (.then (fn [^js r] (is (= 403 (.-status r))) (json-of r)))
+          (.then (fn [^js b]
+                   (is (= "mail-relay.ito/bad-receipt" (.-error b)))
+                   (done)))
+          (.catch (fn [e] (is false (str "threw: " (.-message e) "\n" (.-stack e))) (done)))))))
+
+
+(deftest a-head-from-the-net-with-a-forged-receipt-is-not-held
+  ;; 網から来た head で保持した entry は、後の依頼で『確かめ済み』として扱われる。
+  ;; ここで receipt を確かめないと、偽の receipt が網経由で予算をすり抜ける。
+  (async done
+    (let [st (atom {})]
+      (-> (js/Promise.all #js [(fakes/relay-signing-key) (fakes/relay-signing-key)])
+          (.then (fn [arr]
+                   (let [[trusted forger] (vec arr)
+                         envs (fakes/relays urls :RELAY_RECEIPT_DIDS (:did trusted))]
+                     (swap! st assoc :envs envs :trusted trusted :forger forger)
+                     (world {}))))
+          (.then (fn [w]
+                   (swap! st assoc :w w)
+                   (let [me (:me w)
+                         r {"type" "mail/receipt" "root" (:did @me) "from" "x@example.com"
+                            "to" "me@mail.test" "msg" "bafkreiexample" "at" (.now js/Date)
+                            ;; trusted を名乗るが、署名は偽の鍵
+                            "relay" (:did (:trusted @st))}]
+                     (-> (js/crypto.subtle.importKey "pkcs8" (root-auth/b64-decode (:pkcs8 (:forger @st)))
+                                                     #js {:name "Ed25519"} false #js ["sign"])
+                         (.then (fn [k] (js/crypto.subtle.sign #js {:name "Ed25519"} k
+                                                               (.encode (js/TextEncoder.)
+                                                                        (ito/receipt-message r)))))
+                         (.then (fn [ab]
+                                  (fakes/append! me {"type" "mail/send" "at" (.now js/Date)
+                                                     "to" ["x@example.com"]
+                                                     "receipts" [(assoc r "sig" (eseal/b64url (js/Uint8Array. ab)))]})))
+                         (.then (fn [cid]
+                                  (worker/handle-fetch
+                                   (req :post "/v1/nuno/ops"
+                                        :body {:from "https://evil.test"
+                                               :op {:kind "head" :basis (:did @me) :id cid
+                                                    :payload (fakes/ito-body me)}})
+                                   (get (:envs @st) (first urls)))))))))
+          (.then json-of)
+          (.then (fn [^js b]
+                   (is (= "ignore" (.-verdict b)))
+                   (is (= "mail-relay.ito/bad-receipt" (str "mail-relay.ito/" (.-why b))))
+                   (ito-at (:envs @st) (first urls) (:did @(:me (:w @st))))))
+          (.then (fn [m] (is (nil? (:head m)) "保持していない") (done)))
+          (.catch (fn [e] (is false (str "threw: " (.-message e) "\n" (.-stack e))) (done)))))))

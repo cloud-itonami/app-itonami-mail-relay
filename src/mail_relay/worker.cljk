@@ -219,6 +219,34 @@
            (update inbox-state :directory inbound/note
                    {:address address :sender from :kind kind})))
 
+(defn- relay-key
+  "`RELAY_SIGNING_KEY`（Ed25519 の PKCS#8、base64url）から relay の署名鍵と
+  did:key を作る。未設定なら nil —— receipt を出さない（返信も初めての相手と
+  して数える、今までの動き）。-> Promise<{:did :key} | nil>"
+  [^js env]
+  (if-let [raw (some-> (.-RELAY_SIGNING_KEY env) str not-empty root-auth/b64-decode)]
+    (-> (js/crypto.subtle.importKey "pkcs8" raw #js {:name "Ed25519"} true #js ["sign"])
+        (.then (fn [k]
+                 (.then (js/crypto.subtle.exportKey "jwk" k)
+                        (fn [^js jwk]
+                          {:key k
+                           :did (root-auth/did-key-of (root-auth/b64-decode (.-x jwk)))}))))
+        (.catch (fn [e] (js/console.error "relay key unusable:" (.-message e)) nil)))
+    (js/Promise.resolve nil)))
+
+(defn- issue-receipt
+  "受けた 1 通の receipt。-> Promise<receipt | nil>"
+  [^js env root from to cid]
+  (.then (relay-key env)
+         (fn [rk]
+           (when (and rk root cid)
+             (let [r {"type" "mail/receipt" "root" root
+                      "from" (inbound/normalize-address from) "to" to
+                      "msg" cid "at" (.now js/Date) "relay" (:did rk)}]
+               (-> (js/crypto.subtle.sign #js {:name "Ed25519"} (:key rk)
+                                          (.encode (js/TextEncoder.) (ito/receipt-message r)))
+                   (.then (fn [ab] (assoc r "sig" (b64url (js/Uint8Array. ab)))))))))))
+
 (defn- seal-and-store!
   "`:store` に決まった 1 通を、封じて・pin して・書いて・覚える。"
   [^js env inbox-state {:keys [inbox kind address from raw received-at]} decision]
@@ -232,6 +260,10 @@
                (-> (pin! env (get-in result [:index :mail/cid]))
                    (.then (fn [pinned]
                             (assoc result :index (store/with-pin (:index result) pinned)))))))
+      (.then (fn [result]
+               (.then (issue-receipt env (get-in inbox-state [:recipient :id]) from address
+                                     (get-in result [:index :mail/cid]))
+                      (fn [r] (cond-> result r (assoc-in [:index :mail/receipt] r))))))
       (.then (fn [result] (.then (store-objects! env result) (fn [_] result))))
       (.then (fn [result]
                (js/console.log (inbound/summary-line result))
@@ -346,6 +378,14 @@
                  (cond (some #(= "missing" %) rs) :mail-relay.ito/missing-signature
                        (some false? rs) :mail-relay.ito/bad-signature
                        :else nil))))))
+
+(defn- verify-receipts
+  "糸の receipt の署名を確かめる。-> Promise<nil | :mail-relay.ito/bad-receipt>"
+  [entries]
+  (-> (js/Promise.all
+       (clj->js (map (fn [{:keys [did message sig]}] (root-auth/verify did sig message))
+                     (ito/receipts-to-check entries))))
+      (.then (fn [rs] (when (some false? (vec rs)) :mail-relay.ito/bad-receipt)))))
 
 (defn- make-warrant!
   "分岐から warrant を作って保管する。2 つの entry の署名が両方とも本人の
@@ -487,6 +527,8 @@
                               (ito/signatures-to-check (ito/new-entries entries seen)
                                                        (extra-to-sign entries get-fn))
                               sigs)
+                             (.then (fn [bad]
+                                      (or bad (verify-receipts (ito/new-entries entries seen)))))
                              (.then
                               (fn [bad]
                                 (if bad
@@ -707,7 +749,9 @@
       (-> (admit-ito! env root (:ito body)
                       (fn [entries _]
                         (ito/admit-send entries {:to (concat (:to body) (:cc body))
-                                                 :now (.now js/Date)}))
+                                                 :now (.now js/Date)
+                                                 :receipt-relays
+                                                 (ito/parse-inviters (.-RELAY_RECEIPT_DIDS env))}))
                       (fn [_ _] []))
           (.then
            (fn [r]
@@ -754,6 +798,13 @@
                    (-> (verify-signatures
                         (ito/signatures-to-check (ito/new-entries entries seen) [])
                         sigs)
+                       ;; 網から来た head でも receipt を確かめる。ここで保持した entry は
+                       ;; 次に依頼が来たとき『確かめ済み』として再検査されないため。
+                       (.then (fn [bad]
+                                (or bad
+                                    (ito/receipt-problem entries (ito/parse-inviters
+                                                                  (.-RELAY_RECEIPT_DIDS env)))
+                                    (verify-receipts (ito/new-entries entries seen)))))
                        (.then (fn [bad]
                                 (if bad
                                   (json 200 {:ok true :verdict "ignore" :why (name bad)})

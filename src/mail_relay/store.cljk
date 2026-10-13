@@ -191,7 +191,10 @@
    :cid               (:mail/cid index)
    :pinned            (pinned? index)
    :custody           (some-> (:mail/custody index) name)
-   :sealed            (true? (:mail/sealed index))})
+   :sealed            (true? (:mail/sealed index))
+   ;; relay が署名した『この人が先に書いてきた』証拠。返信の mail/send entry に
+   ;; そのまま入れると、その相手は初めての相手として数えない。
+   :receipt           (:mail/receipt index)})
 
 (defn chunk-string
   "平文を `size` バイトずつに割る。空入力でも 1 chunk 返す —— 空の object も
