@@ -1,0 +1,164 @@
+(ns mail-relay.ito-test
+  "糸の規則。署名はここでは見ない（host の仕事、worker-test が本物で試す）。
+
+  主張は 4 つ:
+  1. 予算はサーバの台帳ではなく、糸を再生して数える
+  2. 初めての相手だけを数える。前に送った相手は何度送っても数えない
+  3. invite の使用回数は、招かれた側の糸を数えて決まる
+  4. 分岐は証拠として取り出せる。古い head の出し直しは分岐とは別に扱う"
+  (:require [kotoba.test :refer [deftest is testing]]
+            [mail-relay.ito :as ito]))
+
+(def alice "did:key:z6MkAlice")
+(def bob "did:key:z6MkBob")
+(def owner "did:key:z6MkOwner")
+
+(def now 1787000000000)
+
+(defn- store []
+  (let [m (atom {})]
+    {:put! (fn [cid bytes] (swap! m assoc cid bytes))
+     :get (fn [cid] (get @m cid))}))
+
+(defn- grow
+  "states を順に積み、各 entry の CID を返す。"
+  [{:keys [put! get]} actor prev states]
+  (reduce (fn [cids st] (conj cids (ito/append! put! get (or (peek cids) prev) actor st)))
+          [] states))
+
+(defn- entries-of [s head actor] (:mail-relay.ito/entries (ito/read-chain (:get s) head actor)))
+
+(defn- send-st [at & to] {"type" "mail/send" "at" at "to" (vec to)})
+
+(defn- invite-st [invitee n]
+  {"type" "invite/issue" "at" now "invitee" invitee "inboxes" n "expires" (+ now 1000000)})
+
+(deftest read-chain-checks-shape-and-actor
+  (let [s (store)
+        [c] (grow s alice nil [(send-st now "a@x.test")])]
+    (testing "自分の entry だけの糸は読める"
+      (is (= :read (:mail-relay/decision (ito/read-chain (:get s) c alice)))))
+
+    (testing "他人の entry を混ぜた糸は断る"
+      (is (= :mail-relay.ito/foreign-entry
+             (:mail-relay/reason (ito/read-chain (:get s) c bob)))))
+
+    (testing "block が無ければ断る"
+      (is (= :mail-relay.ito/broken-chain
+             (:mail-relay/reason (ito/read-chain (constantly nil) c alice)))))
+
+    (testing "知らない型・時刻の逆行は断る"
+      (let [[c2] (grow s alice c [{"type" "mail/blast" "at" now}])]
+        (is (= :mail-relay.ito/unknown-entry-type
+               (:mail-relay/reason (ito/read-chain (:get s) c2 alice)))))
+      (let [[c3] (grow s alice c [(send-st (dec now) "b@x.test")])]
+        (is (= :mail-relay.ito/time-goes-backwards
+               (:mail-relay/reason (ito/read-chain (:get s) c3 alice))))))))
+
+(deftest only-first-contacts-are-counted
+  (let [s (store)
+        cap 3
+        limits {:mail-relay.ito/first-contacts-per-window cap}
+        ;; 3 人に初めて送り、同じ 3 人に何度も送る
+        cids (grow s alice nil [(send-st now "a@x.test" "b@x.test")
+                                (send-st now "c@x.test")
+                                (send-st now "a@x.test")
+                                (send-st now "A@X.test" "c@x.test")])
+        entries (entries-of s (peek cids) alice)]
+    (testing "前に送った相手は数えない（大文字小文字も同じ相手）"
+      (is (= :send (:mail-relay/decision
+                    (ito/admit-send entries {:to ["A@X.test" "c@x.test"] :now now :limits limits}))))
+      (is (= 3 (:mail-relay.ito/first-contacts-used
+                (ito/admit-send entries {:to ["A@X.test" "c@x.test"] :now now :limits limits})))))
+
+    (testing "上限ちょうどまでは通り、1 人超えたら断る"
+      (let [over (grow s alice (peek cids) [(send-st now "d@x.test")])
+            e2 (entries-of s (peek over) alice)]
+        (is (= :mail-relay.ito/first-contact-budget-exhausted
+               (:mail-relay/reason (ito/admit-send e2 {:to ["d@x.test"] :now now :limits limits}))))))
+
+    (testing "窓の外の初めての相手は数えない"
+      (let [day (* 24 60 60 1000)
+            later (+ now day 1)
+            more (grow s alice (peek cids) [(send-st later "d@x.test")])
+            e3 (entries-of s (peek more) alice)]
+        (is (= :send (:mail-relay/decision
+                      (ito/admit-send e3 {:to ["d@x.test"] :now later :limits limits}))))))))
+
+(deftest send-must-match-its-entry
+  (let [s (store)
+        [c] (grow s alice nil [(send-st now "a@x.test")])
+        entries (entries-of s c alice)]
+    (testing "糸に書いた宛先と違う宛先には出さない"
+      (is (= :mail-relay.ito/recipients-do-not-match
+             (:mail-relay/reason (ito/admit-send entries {:to ["b@x.test"] :now now})))))
+
+    (testing "entry の時刻が古すぎるものは断る（後から書いて窓を逃れさせない）"
+      (is (= :mail-relay.ito/stale-entry-time
+             (:mail-relay/reason (ito/admit-send entries {:to ["a@x.test"]
+                                                          :now (+ now (* 10 60 1000))})))))
+
+    (testing "1 通の宛先数の上限"
+      (let [[c2] (grow s alice c [(apply send-st now (map #(str "r" % "@x.test") (range 11)))])]
+        (is (= :mail-relay.ito/too-many-recipients
+               (:mail-relay/reason
+                (ito/admit-send (entries-of s c2 alice)
+                                {:to (map #(str "r" % "@x.test") (range 11)) :now now}))))))))
+
+(deftest invite-uses-are-counted-on-the-invitees-chain
+  (let [s (store)
+        [inv] (grow s owner nil [(invite-st alice 2)])
+        invite (first (entries-of s inv owner))
+        open {"type" "inbox/open" "at" now "invite" inv}
+        three (grow s alice nil [open open open])
+        opts {:invite invite :inviters #{owner} :now now}]
+    (testing "1 回目・2 回目は通る"
+      (is (= :open (:mail-relay/decision (ito/admit-open (entries-of s (nth three 0) alice) opts))))
+      (is (= owner (:mail-relay/invited-by (ito/admit-open (entries-of s (nth three 1) alice) opts)))))
+
+    (testing "3 回目は糸を数えると尽きている —— サーバの uses-left は無い"
+      (is (= :mail-relay.ito/invite-used-up
+             (:mail-relay/reason (ito/admit-open (entries-of s (nth three 2) alice) opts)))))
+
+    (testing "許可リストが空なら誰も招けない。載っていない DID も招けない"
+      (is (= :mail-relay.ito/no-inviters-configured
+             (:mail-relay/reason (ito/admit-open (entries-of s (nth three 0) alice)
+                                                 (assoc opts :inviters #{})))))
+      (is (= :mail-relay.ito/not-an-inviter
+             (:mail-relay/reason (ito/admit-open (entries-of s (nth three 0) alice)
+                                                 (assoc opts :inviters #{bob}))))))
+
+    (testing "他人宛ての invite は使えない"
+      (let [[bob-open] (grow s bob nil [open])]
+        (is (= :mail-relay.ito/invite-is-for-someone-else
+               (:mail-relay/reason (ito/admit-open (entries-of s bob-open bob) opts))))))
+
+    (testing "期限の 1 ms 前は通り、期限ちょうどで通らない"
+      (let [at-ms (fn [t] (let [[c] (grow s alice nil [(assoc open "at" t)])]
+                            (ito/admit-open (entries-of s c alice) (assoc opts :now t))))]
+        (is (= :open (:mail-relay/decision (at-ms (+ now 999999)))))
+        (is (= :mail-relay.ito/invite-expired
+               (:mail-relay/reason (at-ms (+ now 1000000)))))))))
+
+(deftest forks-are-evidence-stale-heads-are-not
+  (let [s (store)
+        base (grow s alice nil [(send-st now "a@x.test")])
+        [left] (grow s alice (peek base) [(send-st now "b@x.test")])
+        [right] (grow s alice (peek base) [(send-st now "c@x.test")])
+        [ahead] (grow s alice left [(send-st now "d@x.test")])
+        g (:get s)]
+    (testing "関係の 5 通り"
+      (is (= :fresh (ito/relation g nil left)))
+      (is (= :same (ito/relation g left left)))
+      (is (= :extends (ito/relation g left ahead)))
+      (is (= :stale (ito/relation g ahead left)))
+      (is (= :fork (ito/relation g left right))))
+
+    (testing "分岐からは同じ seq に立つ 2 つの entry が取り出せる"
+      (let [ev (ito/fork-evidence g left right)]
+        (is (= 1 (:mail-relay.ito/seq ev)))
+        (is (= #{left right} #{(:mail-relay.ito/a ev) (:mail-relay.ito/b ev)}))))
+
+    (testing "まだ確かめていない entry は seen より後だけ"
+      (is (= [ahead] (mapv :cid (ito/new-entries (entries-of s ahead alice) left))))
+      (is (= 3 (count (ito/new-entries (entries-of s ahead alice) nil)))))))

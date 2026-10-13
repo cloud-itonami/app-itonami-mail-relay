@@ -8,7 +8,25 @@
   "../../kotoba-lang/mailer/src"
   "../../kotoba-lang/org-ietf-mime/src"
   "../../kotoba-lang/envelope/src"
-  "../../kotoba-lang/org-signal/src"]
+  "../../kotoba-lang/org-signal/src"
+  ;; 糸（mail-relay.ito）—— kotoba-lang/chain と、それが要る IPLD・CBOR・SHA-256。
+  "../../kotoba-lang/chain/src"
+  "../../kotoba-lang/io-ipld/src"
+  "../../kotoba-lang/io-multiformats/src"
+  "../../kotoba-lang/org-ietf-cbor/src"
+  "../../kotoba-lang/bytes/src"
+  "../../kotoba-lang/org-nist-sha2/src"
+  "../../kotoba-lang/io/src"
+  "../../kotoba-lang/kotoba-io-reader/src"
+  "../../kotoba-lang/kotoba-io-writer/src"
+  "../../kotoba-lang/kotoba-io-buffer-writer/src"
+  "../../kotoba-lang/kotoba-io-put/src"
+  "../../kotoba-lang/kotoba-io-byte-buffer/src"
+  "../../kotoba-lang/kotoba-io-copy/src"
+  "../../kotoba-lang/kotoba-io-len/src"
+  "../../kotoba-lang/kotoba-io-reader-buffer/src"
+  "../../kotoba-lang/kotoba-io-to-bytes/src"
+  "../../kotoba-lang/kotoba-io-reader-seq/src"]
  :dependencies []
  :builds
  {:worker {:target :esm
