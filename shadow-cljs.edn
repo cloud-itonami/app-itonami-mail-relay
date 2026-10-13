@@ -26,7 +26,10 @@
   "../../kotoba-lang/kotoba-io-len/src"
   "../../kotoba-lang/kotoba-io-reader-buffer/src"
   "../../kotoba-lang/kotoba-io-to-bytes/src"
-  "../../kotoba-lang/kotoba-io-reader-seq/src"]
+  "../../kotoba-lang/kotoba-io-reader-seq/src"
+  ;; 布（relay の網）—— kotoba-lang/nuno と、その keyspace の kad-dht。
+  "../../kotoba-lang/nuno/src"
+  "../../kotoba-lang/io-libp2p-specs-kad-dht/src"]
  :dependencies []
  :builds
  {:worker {:target :esm

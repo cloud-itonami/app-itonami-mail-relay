@@ -33,6 +33,10 @@
     :op :ito/get :novel true
     :basis "この relay が見た糸の head と warrant。relay どうしが読み合い、relay をまたいだ分岐を見つける"}
 
+   {:method :post   :path "/v1/nuno/ops"                       :auth :none
+    :op :nuno/receive :novel true
+    :basis "布（relay の網）からの op。head も warrant もそれ自体で正しさを示せるので、受け取った relay が全部自分で確かめる"}
+
    {:method :get    :path "/v1/inboxes/{inbox}"                :auth :key
     :op :inbox/get}
 
