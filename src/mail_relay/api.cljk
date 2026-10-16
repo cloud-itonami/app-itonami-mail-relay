@@ -12,8 +12,7 @@
   |---|---|
   | `:key`  | アカウントの鍵 |
   | `:root` | 所有者の DID。**鍵を失っていても通る** |
-  | `:inviter` | 招く側の DID の署名。host の許可リストに載っていること |
-  | `:none` | 認証なし（入場のみ。本文に invite が要る） |
+  | `:none` | 認証なし（入場は本文の糸と invite で判断する） |
 
   `close` と `keys/rotate` が `:root` なのが、この API の要点。理由は
   `mail-relay.account` の docstring。"
@@ -28,11 +27,15 @@
   `:basis` に書く。宣伝ではなく、消されないための理由。"
   [{:method :post   :path "/v1/inboxes"                        :auth :none
     :op :inbox/open
-    :basis "入場。本文に invite が要る（ADR-2610101117）。PoW は速度制限であって入場の根拠ではない"}
+    :basis "入場。本文に root の糸が要り、その head は招く側が署名した invite を指す（ADR-2610101117）"}
 
-   {:method :post   :path "/v1/invites"                        :auth :inviter
-    :op :invite/issue :novel true
-    :basis "誰が招いたかを残す。乱用した箱を止めたとき、招いた側までたどれる"}
+   {:method :get    :path "/v1/ito/{root}"                     :auth :none
+    :op :ito/get :novel true
+    :basis "この relay が見た糸の head と warrant。relay どうしが読み合い、relay をまたいだ分岐を見つける"}
+
+   {:method :post   :path "/v1/nuno/ops"                       :auth :none
+    :op :nuno/receive :novel true
+    :basis "布（relay の網）からの op。head も warrant もそれ自体で正しさを示せるので、受け取った relay が全部自分で確かめる"}
 
    {:method :get    :path "/v1/inboxes/{inbox}"                :auth :key
     :op :inbox/get}
@@ -57,7 +60,7 @@
 
    {:method :post   :path "/v1/inboxes/{inbox}/messages"       :auth :key
     :op :message/send
-    :basis "mailer の :resend / :ses / :smtp のいずれかへ。Email Routing では送れない"}
+    :basis "本文に root の糸が要る。初めて連絡する相手の数を糸から数え、上限を超えたら断る"}
 
    {:method :post   :path "/v1/inboxes/{inbox}/personas"       :auth :key
     :op :persona/issue :novel true

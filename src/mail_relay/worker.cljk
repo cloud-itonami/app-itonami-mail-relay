@@ -17,17 +17,24 @@
       KV RELAY_DIR
         address:<address>  {:inbox … :kind :persona|:base}   受信の逆引き
         origin:<origin>    account registry                  枠の勘定
-        invite:<digest>    {:issuer :uses-left :expires-at}  入場の invite（digest で引く）
         inbox:<id>         {:origin :directory :recipient :address :webhooks}
       R2 MAIL_BUCKET
         mail/<inbox>/<id>/…   封をした本体
         index/<inbox>/<id>    平文の index
+        ito/<did>             この relay が最後に見た糸の head と block・署名
+        warrant/<did>         分岐の証拠。あれば、その root の開設も送信も断る
+
+  糸（`mail-relay.ito`）の head は**予算の正本ではない**。予算は毎回、root が
+  出した糸を再生して数える。ここに置くのは分岐を見つけるための『最後に見た
+  head』だけで、消えても正しさは壊れず、この relay で古い head を出し直される
+  余地が増えるだけ（ADR-2610101117 の 3）。
 
   registry を origin ごとに置いてあるのは、`active-per-origin` の上限が
   origin ごとの問いだから。**正直に書くと、KV は結果整合なので上限は
-  best-effort** —— 同一 origin から同時に 2 本開くと両方通りうる。厳密に
-  するには R2 の条件付き put か DO が要る。濫用対策（PoW / challenge）を
-  入れる段でそこを詰める。
+  best-effort** —— 同一 origin から同時に 2 本開くと両方通りうる。入場を
+  絞るのは枠ではなく糸と invite（下の『糸』）。registry も糸から再構成できる
+  形に移す。特定の基盤の直列化器（Durable Object など）には依存させない
+  （ADR-2610101117 の 3）。
 
   ## 鍵は一度しか返さない。だから root で閉じられる
 
@@ -41,7 +48,9 @@
             [mail-relay.api :as api]
             [mail-relay.authz :as authz]
             [mail-relay.inbound :as inbound]
-            [mail-relay.invite :as invite]
+            [mail-relay.ito :as ito]
+            [nuno.core :as nuno]
+            [sha2.core :as sha2]
             [mail-relay.resend :as resend]
             [mail-relay.root-auth :as root-auth]
             [mail-relay.seal :as seal]
@@ -210,6 +219,34 @@
            (update inbox-state :directory inbound/note
                    {:address address :sender from :kind kind})))
 
+(defn- relay-key
+  "`RELAY_SIGNING_KEY`（Ed25519 の PKCS#8、base64url）から relay の署名鍵と
+  did:key を作る。未設定なら nil —— receipt を出さない（返信も初めての相手と
+  して数える、今までの動き）。-> Promise<{:did :key} | nil>"
+  [^js env]
+  (if-let [raw (some-> (.-RELAY_SIGNING_KEY env) str not-empty root-auth/b64-decode)]
+    (-> (js/crypto.subtle.importKey "pkcs8" raw #js {:name "Ed25519"} true #js ["sign"])
+        (.then (fn [k]
+                 (.then (js/crypto.subtle.exportKey "jwk" k)
+                        (fn [^js jwk]
+                          {:key k
+                           :did (root-auth/did-key-of (root-auth/b64-decode (.-x jwk)))}))))
+        (.catch (fn [e] (js/console.error "relay key unusable:" (.-message e)) nil)))
+    (js/Promise.resolve nil)))
+
+(defn- issue-receipt
+  "受けた 1 通の receipt。-> Promise<receipt | nil>"
+  [^js env root from to cid]
+  (.then (relay-key env)
+         (fn [rk]
+           (when (and rk root cid)
+             (let [r {"type" "mail/receipt" "root" root
+                      "from" (inbound/normalize-address from) "to" to
+                      "msg" cid "at" (.now js/Date) "relay" (:did rk)}]
+               (-> (js/crypto.subtle.sign #js {:name "Ed25519"} (:key rk)
+                                          (.encode (js/TextEncoder.) (ito/receipt-message r)))
+                   (.then (fn [ab] (assoc r "sig" (b64url (js/Uint8Array. ab)))))))))))
+
 (defn- seal-and-store!
   "`:store` に決まった 1 通を、封じて・pin して・書いて・覚える。"
   [^js env inbox-state {:keys [inbox kind address from raw received-at]} decision]
@@ -223,6 +260,10 @@
                (-> (pin! env (get-in result [:index :mail/cid]))
                    (.then (fn [pinned]
                             (assoc result :index (store/with-pin (:index result) pinned)))))))
+      (.then (fn [result]
+               (.then (issue-receipt env (get-in inbox-state [:recipient :id]) from address
+                                     (get-in result [:index :mail/cid]))
+                      (fn [r] (cond-> result r (assoc-in [:index :mail/receipt] r))))))
       (.then (fn [result] (.then (store-objects! env result) (fn [_] result))))
       (.then (fn [result]
                (js/console.log (inbound/summary-line result))
@@ -298,54 +339,254 @@
       (.then #(if (str/blank? %) {} (js->clj (js/JSON.parse %) :keywordize-keys true)))
       (.catch (fn [_] ::bad-json))))
 
-(defn- load-invite [env code]
-  (if (str/blank? (str code))
-    (js/Promise.resolve [nil nil])
-    (-> (key-digest (str code))
-        (.then (fn [digest]
-                 (.then (kv-get env (str "invite:" digest)) (fn [inv] [digest inv])))))))
+(defn- r2-edn-get [^js env k]
+  (-> (.get (.-MAIL_BUCKET env) k)
+      (.then (fn [^js o] (when o (.then (.text o) reader/read-string))))))
 
-(defn- invite-refusal [d]
-  (fail (get invite/status-for-reason (:mail-relay/reason d) 403)
-        (:mail-relay/reason d)
-        {:basis (:mail-relay/basis d)}))
+(defn- r2-edn-put! [^js env k v] (.put (.-MAIL_BUCKET env) k (pr-str v)))
 
-(defn- op-invite-issue [^js env did body]
-  (let [code (str "inv_" (b64url (random-bytes 24)))]
-    (-> (key-digest code)
-        (.then
-         (fn [digest]
-           (let [d (invite/issue {:issuer did
-                                  :inviters (invite/parse-inviters (.-RELAY_INVITER_ROOTS env))
-                                  :code-digest digest
-                                  :uses (:uses body)
-                                  :ttl-ms (:ttl_ms body)
-                                  :now (.now js/Date)})]
-             (if (not= :issue (:mail-relay/decision d))
-               (invite-refusal d)
-               (let [inv (:mail-relay/invite d)]
-                 (-> (kv-put! env (str "invite:" digest) inv)
-                     (.then (fn [_]
-                              (json 201 {:ok true :invite code
-                                         :uses (:mail-relay.invite/uses-left inv)
-                                         :expires_at (:mail-relay.invite/expires-at inv)
-                                         :note "この invite はここでしか返らない"}))))))))))))
+(defn- ito-key [did] (str "ito/" did))
+(defn- warrant-key [did] (str "warrant/" did))
 
-(declare open-with-invite)
+(defn- ito-fail
+  ([reason] (ito-fail reason nil))
+  ([reason attrs]
+   (fail (get ito/status-for-reason reason 400) reason attrs)))
+
+(defn- decode-blocks
+  "{cid b64} -> {cid Uint8Array}。読めない値は捨てる（捨てた block は糸の
+  検証で欠けとして見つかる）。JSON の鍵は keyword になって来るので名前に戻す。"
+  [m]
+  (into {} (keep (fn [[k v]] (when-let [b (root-auth/b64-decode v)] [(name k) b]))) m))
+
+(defn- encode-blocks [m cids]
+  (into {} (keep (fn [cid] (when-let [b (get m cid)] [cid (b64url b)]))) cids))
+
+(defn- string-keys [m] (into {} (map (fn [[k v]] [(name k) (str v)])) m))
+
+(defn- verify-signatures
+  "-> Promise<nil | 理由>。1 つでも欠けているか違えば断る。"
+  [checks sigs]
+  (-> (js/Promise.all
+       (clj->js (map (fn [{:keys [did cid message]}]
+                       (if-let [sig (get sigs cid)]
+                         (root-auth/verify did sig message)
+                         (js/Promise.resolve "missing")))
+                     checks)))
+      (.then (fn [rs]
+               (let [rs (vec rs)]
+                 (cond (some #(= "missing" %) rs) :mail-relay.ito/missing-signature
+                       (some false? rs) :mail-relay.ito/bad-signature
+                       :else nil))))))
+
+(defn- verify-receipts
+  "糸の receipt の署名を確かめる。-> Promise<nil | :mail-relay.ito/bad-receipt>"
+  [entries]
+  (-> (js/Promise.all
+       (clj->js (map (fn [{:keys [did message sig]}] (root-auth/verify did sig message))
+                     (ito/receipts-to-check entries))))
+      (.then (fn [rs] (when (some false? (vec rs)) :mail-relay.ito/bad-receipt)))))
+
+(defn- make-warrant!
+  "分岐から warrant を作って保管する。2 つの entry の署名が両方とも本人の
+  ものでなければ作らない（他人が作った偽の分岐で root を止めさせない）。
+  -> Promise<{:warrant w} | {:bad 理由}>"
+  [^js env did get-fn seen head sigs blocks]
+  (let [ev (ito/fork-evidence get-fn seen head)
+        a (:mail-relay.ito/a ev)
+        b (:mail-relay.ito/b ev)]
+    (if-not ev
+      (js/Promise.resolve {:bad :mail-relay.ito/broken-chain})
+      (-> (verify-signatures [{:did did :cid a :message (ito/signing-message a)}
+                              {:did did :cid b :message (ito/signing-message b)}]
+                             sigs)
+          (.then (fn [bad]
+                   (if bad
+                     {:bad bad}
+                     (let [w {:actor did :seq (:mail-relay.ito/seq ev) :a a :b b
+                              :sigs {a (get sigs a) b (get sigs b)}
+                              :blocks (encode-blocks blocks [a b])
+                              :at (.now js/Date)}]
+                       (.then (r2-edn-put! env (warrant-key did) w)
+                              (fn [_] {:warrant w}))))))))))
+
+;; ------------------------------------------------------------ 布
+
+;; relay どうしの網（`nuno.core`、ADR-2610082200 の 布）。`RELAY_PEERS` が空なら
+;; 何もしない —— relay が 1 台なら今までと同じ。
+;;
+;; 網に流すものは全部、それ自体で正しさを示せる: head は root が署名した糸、
+;; warrant は root が署名した 2 つの entry。受け取った relay は送り手を信用
+;; せず、全部自分で確かめる。だから `/v1/nuno/ops` に認証は要らない。
+
+(defn- sha256-sync
+  "`kad.key/dht-key` は同期の SHA-256 を求める。Web Crypto は非同期なので、
+  keyspace の位置を決めるためだけに純粋実装を使う（秘密は扱わない）。"
+  [^js u8]
+  (js/Uint8Array.from (clj->js (sha2/sha256 (array-seq u8)))))
+
+(defn- self-id [^js env] (or (some-> (.-RELAY_SELF env) str not-empty) (str "https://" domain)))
+
+(defn- peer-ids [^js env]
+  (vec (remove #{(self-id env)} (ito/parse-inviters (.-RELAY_PEERS env)))))
+
+(defn- nuno-node [^js env]
+  (nuno/node {:id (self-id env) :peers (peer-ids env) :sha256 sha256-sync}))
+
+(defn- op->wire [o]
+  {:kind (name (:nuno/kind o)) :basis (:nuno/basis o) :id (:nuno/id o)
+   :payload (:nuno/payload o)})
+
+(defn- wire->op [m]
+  (nuno/op (keyword (str (:kind m))) (some-> (:basis m) str) (some-> (:id m) str) (:payload m)))
+
+(defn- head-op [did head blocks sigs cids]
+  (nuno/op :head did head {:head head
+                           :blocks (encode-blocks blocks cids)
+                           :sigs (select-keys sigs cids)}))
+
+(defn- warrant-op [w]
+  (nuno/op :warrant (:actor w) (str "warrant:" (:actor w) ":" (str/join ":" (sort [(:a w) (:b w)])))
+           w))
+
+(defn- send-ops!
+  "`[[宛先 op] …]` を配る。自分宛ては落とす（自分はもう保持している）。
+  届かない相手は記録だけして先へ進む —— 網の 1 台が落ちていても依頼は止めない。"
+  [^js env out]
+  (let [f (or (.-RELAY_FETCH env) js/fetch)
+        me (self-id env)]
+    (js/Promise.all
+     (clj->js
+      (for [[to o] out :when (not= to me)]
+        (-> (f (str to "/v1/nuno/ops")
+               #js {:method "POST"
+                    :headers #js {"content-type" "application/json"}
+                    :body (js/JSON.stringify (clj->js {:from me :op (op->wire o)}))})
+            (.catch (fn [e] (js/console.error "nuno: send failed" to (.-message e)) nil))))))))
+
+(defn- publish-head! [^js env did head blocks sigs cids]
+  (if (empty? (peer-ids env))
+    (js/Promise.resolve nil)
+    (send-ops! env (:nuno/out (nuno/publish (nuno-node env) (head-op did head blocks sigs cids))))))
+
+(defn- flood-warrant! [^js env w from]
+  (if (empty? (peer-ids env))
+    (js/Promise.resolve nil)
+    (let [o (warrant-op w)]
+      (send-ops! env (:nuno/out (nuno/settle (nuno-node env) o from {:verdict :valid}))))))
+
+(defn- record-fork!
+  "分岐を見つけた。warrant を作れれば保管して網に流し、断る。"
+  [^js env did get-fn seen head sigs blocks]
+  (-> (make-warrant! env did get-fn seen head sigs blocks)
+      (.then (fn [{:keys [warrant bad]}]
+               (if bad
+                 (ito-fail bad)
+                 (.then (flood-warrant! env warrant nil)
+                        (fn [_]
+                          (ito-fail :mail-relay.ito/forked
+                                    {:warrant warrant
+                                     :basis "同じ位置に別々の entry を 2 つ署名した。この root は止まる"}))))))))
+
+(defn- admit-ito!
+  "root の糸を読み、検証し、`decide` を当てはめる。
+
+  通ったときだけ、この relay が最後に見た head を進める。`decide` が断れば
+  何も書かない —— その entry は relay が見ていないので、client は前の head
+  から積み直してよい（見ていない entry は分岐の証拠にならない）。
+
+  -> Promise<{:ok decision} | Response>"
+  [^js env did ito-body decide extra-to-sign]
+  (-> (js/Promise.all #js [(r2-edn-get env (ito-key did)) (r2-edn-get env (warrant-key did))])
+      (.then
+       (fn [arr]
+         (let [[rec warrant] (vec arr)
+               blocks (merge (decode-blocks (:blocks rec)) (decode-blocks (:blocks ito-body)))
+               sigs (merge (:sigs rec) (string-keys (:sigs ito-body)))
+               get-fn #(get blocks %)
+               head (some-> (:head ito-body) str not-empty)
+               seen (:head rec)]
+           (if warrant
+             (ito-fail :mail-relay.ito/forked {:warrant warrant})
+             (let [r (ito/read-chain get-fn head did)]
+               (if (not= :read (:mail-relay/decision r))
+                 (ito-fail (:mail-relay/reason r) {:basis (:mail-relay/basis r)})
+                 (let [entries (:mail-relay.ito/entries r)]
+                   (case (ito/relation get-fn seen head)
+                     :fork (record-fork! env did get-fn seen head sigs blocks)
+                     (:same :stale) (ito-fail :mail-relay.ito/stale-head
+                                              {:seen seen
+                                               :basis "最後に見た head より先に積んだ entry が要る"})
+                     (let [d (decide entries get-fn)]
+                       (if (= :refuse (:mail-relay/decision d))
+                         (ito-fail (:mail-relay/reason d)
+                                   {:basis (:mail-relay/basis d)
+                                    :limit (:mail-relay.ito/limit d)
+                                    :used (:mail-relay.ito/used d)})
+                         (-> (verify-signatures
+                              (ito/signatures-to-check (ito/new-entries entries seen)
+                                                       (extra-to-sign entries get-fn))
+                              sigs)
+                             (.then (fn [bad]
+                                      (or bad (verify-receipts (ito/new-entries entries seen)))))
+                             (.then
+                              (fn [bad]
+                                (if bad
+                                  (ito-fail bad)
+                                  (let [cids (map :cid entries)]
+                                    (-> (r2-edn-put! env (ito-key did)
+                                                     {:head head
+                                                      :blocks (encode-blocks blocks cids)
+                                                      :sigs (select-keys sigs cids)})
+                                        ;; 進めた head を authority に配る。
+                                        (.then (fn [_] (publish-head! env did head blocks sigs cids)))
+                                        (.then (fn [_] {:ok d}))))))))))))))))))))
+
+(defn- response? [x] (instance? js/Response x))
+
+(defn- invite-of
+  "head の inbox/open が指す invite（招く側の invite/issue）。block が無いか
+  壊れていれば nil。"
+  [entries get-fn]
+  (when-let [cid (some-> (peek entries) :state (get "invite") str)]
+    (ito/entry-at get-fn cid)))
+
+(declare open-account)
 
 (defn- op-inbox-open [^js env body]
-  (-> (load-invite env (:invite body))
-      (.then
-       (fn [[invite-digest inv]]
-         (if (str/blank? (str (:invite body)))
-           (fail 403 :mail-relay.invite/missing-invite
-                 {:basis "箱を開くには invite が要る（ADR-2610101117）"})
-           (let [d (invite/redeem inv {:now (.now js/Date)})]
-             (if (not= :redeem (:mail-relay/decision d))
-               (invite-refusal d)
-               (open-with-invite env body invite-digest d))))))))
+  (let [root (:root body)
+        origin (or (:origin body) "unknown")]
+    (if (str/blank? (str root))
+      (js/Promise.resolve
+       (fail 400 :missing-root
+             {:basis "root が無いと、鍵を失ったときに閉じることも回すこともできなくなる"}))
+      (-> (load-origin-registry env origin)
+          (.then
+           (fn [registry]
+             (-> (admit-ito!
+                  env root (:ito body)
+                  (fn [entries get-fn]
+                    (let [d (ito/admit-open entries
+                                            {:invite (invite-of entries get-fn)
+                                             :inviters (ito/parse-inviters (.-RELAY_INVITER_ROOTS env))
+                                             :now (.now js/Date)})]
+                      ;; 枠の判断もここで済ませる。断るなら head を進めない ——
+                      ;; 枠で断られた試行に invite を使わせないため。
+                      (if (and (= :open (:mail-relay/decision d))
+                               (>= (count (account/active-at-origin registry origin))
+                                   (:mail-relay.limit/active-per-origin account/default-limits)))
+                        {:mail-relay/decision :refuse
+                         :mail-relay/reason :mail-relay/origin-slot-taken
+                         :mail-relay/basis "この origin の枠は埋まっている。close で解放できる"}
+                        d)))
+                  (fn [entries get-fn] [(invite-of entries get-fn)]))
+                 (.then (fn [r]
+                          (if (response? r)
+                            r
+                            (open-account env body registry
+                                          (:mail-relay/invited-by (:ok r)))))))))))))
 
-(defn- open-with-invite [^js env body invite-digest redeemed]
+(defn- open-account [^js env body registry invited-by]
   (let [root (:root body)
         pub (:pub body)
         origin (or (:origin body) "unknown")
@@ -370,12 +611,12 @@
       (-> (key-digest raw-key)
           (.then
            (fn [digest]
-             (-> (load-origin-registry env origin)
+             (-> (js/Promise.resolve registry)
                  (.then
                   (fn [registry]
                     (let [d (account/open registry {:id id :root root :key-digest digest
                                                     :origin origin :now (.now js/Date)
-                                                    :invited-by (:mail-relay/issuer redeemed)})]
+                                                    :invited-by invited-by})]
                       (if (not= :open (:mail-relay/decision d))
                         (fail 409 (:mail-relay/reason d)
                               {:held (:mail-relay/held d) :basis (:mail-relay/basis d)})
@@ -387,11 +628,7 @@
                                             :directory (persona/directory)
                                             :recipient {:id root :pub pub :custody :self}
                                             :webhooks []})
-                                  (kv-put! env (str "address:" address) {:inbox id :kind :base})
-                                  ;; invite は箱が開けたときだけ減らす。枠で断られた
-                                  ;; 試行が invite を食いつぶさないように。
-                                  (kv-put! env (str "invite:" invite-digest)
-                                           (:mail-relay/invite redeemed))])
+                                  (kv-put! env (str "address:" address) {:inbox id :kind :base})])
                             (.then (fn [_]
                                      (json 201 {:ok true :inbox id :address address
                                                 :key raw-key
@@ -506,15 +743,133 @@
        (fail 400 (:mail-relay/reason d)
              {:basis (:mail-relay/basis d) :errors (:mail-relay/errors d)
               :signals (mapv :persona.relay/signal (:mail-relay/signals d))}))
-      (-> (resend/send! env (:mail-relay/request d))
-          (.then (fn [result]
-                   (if (= :sent (:status result))
-                     (json 202 {:ok true :from (:mail-relay/from d)
-                                :provider (name (:mail-relay/provider d))
-                                :message_id (:message-id result)
-                                :signals (mapv :persona.relay/signal (:mail-relay/signals d))})
-                     (fail 502 :send-failed {:provider (name (:mail-relay/provider d))
-                                             :detail (:error result)}))))))))
+      ;; 出す前に root の糸で予算を確かめる。通れば head が進み、その entry は
+      ;; 使ったことになる（provider が失敗しても戻さない —— 糸は root が署名
+      ;; したもので、relay が書き換えるものではない）。
+      (-> (admit-ito! env root (:ito body)
+                      (fn [entries _]
+                        (ito/admit-send entries {:to (concat (:to body) (:cc body))
+                                                 :now (.now js/Date)
+                                                 :receipt-relays
+                                                 (ito/parse-inviters (.-RELAY_RECEIPT_DIDS env))}))
+                      (fn [_ _] []))
+          (.then
+           (fn [r]
+             (if (response? r)
+               r
+               (-> (resend/send! env (:mail-relay/request d))
+                   (.then (fn [result]
+                            (if (= :sent (:status result))
+                              (json 202 {:ok true :from (:mail-relay/from d)
+                                         :provider (name (:mail-relay/provider d))
+                                         :message_id (:message-id result)
+                                         :first_contacts_left
+                                         (:mail-relay.ito/first-contacts-left (:ok r))
+                                         :signals (mapv :persona.relay/signal (:mail-relay/signals d))})
+                              (fail 502 :send-failed {:provider (name (:mail-relay/provider d))
+                                                      :detail (:error result)}))))))))))))
+
+(defn- receive-head!
+  "網から届いた head。この relay が最後に見た head と比べ、伸びていれば保持、
+  同じか古ければ無視、分岐していれば warrant を作って網に流す。"
+  [^js env from o]
+  (let [did (:nuno/basis o)
+        p (:nuno/payload o)]
+    (-> (r2-edn-get env (ito-key did))
+        (.then
+         (fn [rec]
+           (let [blocks (merge (decode-blocks (:blocks rec)) (decode-blocks (:blocks p)))
+                 sigs (merge (:sigs rec) (string-keys (:sigs p)))
+                 get-fn #(get blocks %)
+                 head (some-> (:head p) str not-empty)
+                 seen (:head rec)
+                 r (ito/read-chain get-fn head did)]
+             (if (not= :read (:mail-relay/decision r))
+               (json 200 {:ok true :verdict "ignore" :why (name (:mail-relay/reason r))})
+               (let [entries (:mail-relay.ito/entries r)]
+                 (case (ito/relation get-fn seen head)
+                   (:same :stale) (json 200 {:ok true :verdict "ignore" :why "not-newer"})
+                   :fork (-> (make-warrant! env did get-fn seen head sigs blocks)
+                             (.then (fn [{:keys [warrant bad]}]
+                                      (if bad
+                                        (json 200 {:ok true :verdict "ignore" :why (name bad)})
+                                        (.then (flood-warrant! env warrant nil)
+                                               (fn [_] (json 200 {:ok true :verdict "conflict"})))))))
+                   (-> (verify-signatures
+                        (ito/signatures-to-check (ito/new-entries entries seen) [])
+                        sigs)
+                       ;; 網から来た head でも receipt を確かめる。ここで保持した entry は
+                       ;; 次に依頼が来たとき『確かめ済み』として再検査されないため。
+                       (.then (fn [bad]
+                                (or bad
+                                    (ito/receipt-problem entries (ito/parse-inviters
+                                                                  (.-RELAY_RECEIPT_DIDS env)))
+                                    (verify-receipts (ito/new-entries entries seen)))))
+                       (.then (fn [bad]
+                                (if bad
+                                  (json 200 {:ok true :verdict "ignore" :why (name bad)})
+                                  (let [cids (map :cid entries)]
+                                    (.then (r2-edn-put! env (ito-key did)
+                                                        {:head head
+                                                         :blocks (encode-blocks blocks cids)
+                                                         :sigs (select-keys sigs cids)})
+                                           (fn [_] (json 202 {:ok true :verdict "hold"})))))))))))))))))
+
+(defn- receive-warrant!
+  "網から届いた warrant。証拠を**自分で**確かめる: 2 つの entry が block から
+  読め、両方とも basis の entry で、同じ seq に立ち、別物で、両方の署名が
+  本人のもの。本物なら保管して、送ってきた相手以外へ流す。偽物は流さない。"
+  [^js env from o]
+  (let [w (:nuno/payload o)
+        did (:nuno/basis o)
+        blocks (decode-blocks (:blocks w))
+        sigs (string-keys (:sigs w))
+        get-fn #(get blocks %)
+        a (some-> (:a w) str)
+        b (some-> (:b w) str)
+        ea (when a (ito/entry-at get-fn a))
+        eb (when b (ito/entry-at get-fn b))]
+    (if-not (and ea eb (not= a b)
+                 (= did (:actor ea) (:actor eb))
+                 (= (:seq ea) (:seq eb)))
+      (js/Promise.resolve (json 200 {:ok true :verdict "invalid"}))
+      (-> (verify-signatures [{:did did :cid a :message (ito/signing-message a)}
+                              {:did did :cid b :message (ito/signing-message b)}]
+                             sigs)
+          (.then (fn [bad]
+                   (if bad
+                     (json 200 {:ok true :verdict "invalid" :why (name bad)})
+                     (let [stored {:actor did :seq (:seq ea) :a a :b b :sigs sigs
+                                   :blocks (:blocks w) :at (.now js/Date)
+                                   :via from}]
+                       (-> (r2-edn-put! env (warrant-key did) stored)
+                           (.then (fn [_] (flood-warrant! env stored from)))
+                           (.then (fn [_] (json 202 {:ok true :verdict "valid"}))))))))))))
+
+(defn- op-nuno-receive [^js env body]
+  (let [o (wire->op (:op body))
+        from (some-> (:from body) str not-empty)
+        did (:nuno/basis o)]
+    (-> (js/Promise.all #js [(r2-edn-get env (warrant-key (str did)))])
+        (.then
+         (fn [arr]
+           (let [w (first (vec arr))
+                 n (cond-> (nuno-node env) w (assoc-in [:nuno/warrants did] w))
+                 i (nuno/inspect n o)]
+             (case (:nuno/action i)
+               :ignore (json 200 {:ok true :verdict "ignore" :why (name (:nuno/why i))})
+               :judge-head (receive-head! env from o)
+               :judge-warrant (receive-warrant! env from o))))))))
+
+(defn- op-ito-get
+  "この relay が最後に見た糸の head と、あれば warrant。relay どうしが互いの
+  見たものを読み合い、relay をまたいだ分岐を見つけるための面。"
+  [^js env root]
+  (-> (js/Promise.all #js [(r2-edn-get env (ito-key root)) (r2-edn-get env (warrant-key root))])
+      (.then (fn [arr]
+               (let [[rec warrant] (vec arr)]
+                 (json 200 {:ok true :root root :head (:head rec)
+                            :warrant warrant}))))))
 
 (defn- op-persona-issue [^js env inbox-state registry inbox body]
   (let [root (get-in registry [:mail-relay/accounts inbox :mail-relay.account/root])
@@ -610,7 +965,8 @@
                                            (inbound/normalize-address (:address params)))))
    :webhook/create  (fn [{:keys [env inbox-state inbox body]}]
                       (op-webhook-create env inbox-state inbox body))
-   :invite/issue    (fn [{:keys [env did body]}] (op-invite-issue env did body))})
+   :ito/get         (fn [{:keys [env params]}] (op-ito-get env (:root params)))
+   :nuno/receive    (fn [{:keys [env body]}] (op-nuno-receive env body))})
 
 (defn- run-op [ctx]
   (if-let [f (get ops (get-in ctx [:route :op]))]
@@ -684,19 +1040,7 @@
              (:mail-relay.authz/reason check)
              {:basis (:mail-relay/basis check)}))
 
-      :none (run-op {:env env :route route :body body})
-
-      ;; 招く側。箱に紐づかないので、署名を検証したら許可リストの判断は
-      ;; `invite/issue` に任せる。
-      :inviter
-      (-> (root-auth/verify (:mail-relay.authz/did check)
-                            (:mail-relay.authz/signature check)
-                            (:mail-relay.authz/message check))
-          (.then (fn [ok?]
-                   (if-not ok?
-                     (fail 403 :mail-relay.authz/bad-signature)
-                     (run-op {:env env :route route :body body
-                              :did (:mail-relay.authz/did check)})))))
+      :none (run-op {:env env :route route :body body :params (:params route)})
 
       (run-authenticated env route body check))))
 

@@ -1,16 +1,48 @@
 {
   "jobs": [
     {
+      "base_url": "https://api.murakumo.cloud/v1",
+      "context_from": null,
+      "deliver": "local",
+      "enabled": true,
+      "enabled_toolsets": [
+        "terminal",
+        "file",
+        "web",
+        "skills"
+      ],
+      "id": "3926a8cfbb1a",
+      "model": "mishima",
+      "name": "mail-relay-tick",
+      "no_agent": false,
+      "prompt": "SOUL.md の 1 反復手順を実行する: 正本 (app-mail-relay README + api.cljc route 表) を読み、state/relay-account.json の inbox_key で GET /v1/inboxes/{inbox}/messages を観測し、報告書式で propose-only の報告を 1 件出す。送信・persona 発行・rotate は実行しない。",
+      "provider": "murakumo",
+      "schedule": {
+        "kind": "interval",
+        "minutes": 360,
+        "display": "every 360m"
+      },
+      "script": null,
+      "skill": null,
+      "skills": [],
+      "workdir": null
+    },
+    {
       "base_url": null,
       "context_from": null,
       "deliver": "local",
       "enabled": true,
-      "enabled_toolsets": null,
-      "id": "3926a8cfbb1a",
+      "enabled_toolsets": [
+        "terminal",
+        "file",
+        "web",
+        "skills"
+      ],
+      "id": "a23d8ac2918b",
       "model": null,
-      "name": "mail-relay-tick",
+      "name": "mail-relay-dev",
       "no_agent": false,
-      "prompt": "SOUL.md の 1 反復手順を実行する: 正本 (app-mail-relay README + api.cljc route 表) を読み、state/relay-account.json の inbox_key で GET /v1/inboxes/{inbox}/messages を観測し、報告書式で propose-only の報告を 1 件出す。送信・persona 発行・rotate は実行しない。",
+      "prompt": "SOUL.md の『開発の 1 反復』を実行する: backlog から 1 件取り、人の手が要るものなら見送り、そうでなければ work/mail-relay/<id> の worktree で実装し、test-run.cljk が exit 0 になってから PR を出す（本文の最後に Backlog-Item: <id>）。merge はしない。",
       "provider": null,
       "schedule": {
         "kind": "interval",

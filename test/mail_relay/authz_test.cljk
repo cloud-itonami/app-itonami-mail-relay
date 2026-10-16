@@ -75,8 +75,12 @@
           (authz/require-for {:auth :key :headers {} :now-seconds now})))))
 
 (deftest entry-is-the-only-unauthenticated-route
-  (testing "表の :none は入場 1 本だけ"
-    (is (= [:inbox/open] (mapv :op (filter #(= :none (:auth %)) api/routes)))))
+  (testing "認証なしで書けるのは入場と、布からの op だけ —— どちらも本文の署名で判断する"
+    (is (= [:inbox/open :nuno/receive]
+           (mapv :op (filter #(and (= :none (:auth %)) (not= :get (:method %))) api/routes)))))
+  (testing "認証なしで読めるのは糸の公開面だけ —— head と warrant は relay どうしが読み合うもの"
+    (is (= [:ito/get] (mapv :op (filter #(and (= :none (:auth %)) (= :get (:method %)))
+                                        api/routes)))))
   (is (= :none (:mail-relay.authz/check
                 (authz/require-for {:auth :none :headers {} :now-seconds now})))))
 

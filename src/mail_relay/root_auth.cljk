@@ -43,6 +43,22 @@
             out (concat (repeat leading 0) body)]
         (js/Uint8Array.from (clj->js (vec out)))))))
 
+(defn b58-encode
+  "bytes -> base58btc。relay が自分の did:key を名乗るためにだけ使う。"
+  [bytes]
+  (let [digits (array 0)]
+    (doseq [b bytes]
+      (let [carry (atom b)]
+        (dotimes [i (alength digits)]
+          (let [x (+ (* (aget digits i) 256) @carry)]
+            (aset digits i (mod x 58))
+            (reset! carry (js/Math.floor (/ x 58)))))
+        (while (pos? @carry)
+          (.push digits (mod @carry 58))
+          (swap! carry #(js/Math.floor (/ % 58))))))
+    (str (apply str (repeat (count (take-while zero? bytes)) "1"))
+         (apply str (map #(nth b58-alphabet %) (reverse (array-seq digits)))))))
+
 (def ^:private ed25519-multicodec
   "multicodec `ed25519-pub` = varint 0xed 0x01。"
   [0xed 0x01])
@@ -58,6 +74,11 @@
           (when (and (= ed25519-multicodec (subvec bytes 0 (min 2 (count bytes))))
                      (= 34 (count bytes)))
             (js/Uint8Array.from (clj->js (subvec bytes 2)))))))))
+
+(defn did-key-of
+  "Ed25519 公開鍵（32 bytes）-> `did:key:z…`。"
+  [pub]
+  (str "did:key:z" (b58-encode (concat ed25519-multicodec (array-seq pub)))))
 
 (defn b64-decode
   "base64 でも base64url でも Uint8Array にする。"

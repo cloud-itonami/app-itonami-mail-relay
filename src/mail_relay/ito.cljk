@@ -1,0 +1,397 @@
+(ns mail-relay.ito
+  "各 root 自身の糸（ito、source chain）を読み、規則を再生して、開設・送信を
+  通してよいかを答える。**予算の正本はサーバに置かない**（ADR-2610101117 の 3、
+  owner 指示 2026-10-13）。
+
+  機構はここに無い。署名の検証（Ed25519）も block の取得も host の仕事で、
+  ここが返すのは『どの block のどの署名を確かめよ』『この依頼は規則に
+  合うか』という値だけ。
+
+  ## 糸の形
+
+  1 つの entry は `kotoba-lang/chain` の commit 1 つ。`actor` は root の DID、
+  `prev` は同じ root の 1 つ前の entry、`state` は次のどれか:
+
+      {\"type\" \"invite/issue\" \"at\" ms \"invitee\" did \"inboxes\" n \"expires\" ms}
+      {\"type\" \"inbox/open\"   \"at\" ms \"invite\" <招く側の invite/issue の CID>}
+      {\"type\" \"mail/send\"    \"at\" ms \"to\" [address …] \"receipts\" [receipt …]}
+
+  ## 返信は初めての相手として数えない
+
+  relay は受けた 1 通ごとに **receipt** を出す: 『この差出人が、この root に、
+  この CID の 1 通を送った』を relay 自身の did:key で署名したもの
+  （`receipt-message`）。root はその人への返信の mail/send entry に receipt を
+  入れる。receipt の差出人は初めての相手として数えない。receipt を偽れるのは
+  relay の鍵を持つ者だけで、どの relay も署名と、信頼する relay の DID の
+  一覧だけから同じ答えに至る。
+
+  署名は commit の中に入れられない（署名が自分自身の CID を覆えない）ので、
+  `signing-message` を root の did:key で署名したものを、CID ごとに別に運ぶ。
+
+  ## relay は検証者であって台帳の持ち主ではない
+
+  relay が覚えているのは『この root の糸で最後に見た head』だけで、それは
+  分岐を見つけるための証拠置き場。予算は毎回、糸を最初から再生して数える。
+  同じ糸を渡されたどの relay も同じ答えに至るので、relay は何台でも置ける。
+
+  ## 二重使用は防がず、証明できるようにする
+
+  同じ位置（seq）に別々の entry を 2 つ署名した糸は、それ自体が改ざんできない
+  不正の証拠になる（`fork-evidence`）。host はそれを warrant として保管・公開し、
+  その root を止める。古い head を出し直すこと（`:stale`）は署名の矛盾では
+  ないので warrant にはせず、最新の head を求めて断る。"
+  (:require [chain.core :as chain]
+            [kotoba.lang.text :as str]))
+
+(def schema "mail-relay.ito.v1")
+
+(def entry-types #{"invite/issue" "inbox/open" "mail/send"})
+
+(def default-limits
+  "初期値。運用しながら決める（ADR-2610101117 の gaps）。"
+  {:mail-relay.ito/first-contacts-per-window 20
+   :mail-relay.ito/window-ms (* 24 60 60 1000)
+   :mail-relay.ito/recipients-per-message 10
+   :mail-relay.ito/max-inboxes-per-invite 10
+   :mail-relay.ito/max-invite-ttl-ms (* 30 24 60 60 1000)
+   :mail-relay.ito/clock-skew-ms (* 5 60 1000)})
+
+(defn- refuse [reason & {:as attrs}]
+  (merge {:mail-relay/decision :refuse :mail-relay/reason reason} attrs))
+
+(defn signing-message
+  "root が entry 1 つに対して署名する文字列。schema を入れるのは、別の用途の
+  署名（authz の challenge など）を糸の entry として流用させないため。"
+  [cid]
+  (str schema "\n" cid))
+
+(defn append!
+  "糸に entry を 1 つ足す（client 側で使う）。`(put! cid bytes)` を呼び、新しい
+  CID を返す。`prev` は 1 つ前の entry の CID、最初の 1 つは nil。"
+  [put! get-fn prev actor state]
+  (chain/commit! put! get-fn state prev {:actor actor}))
+
+(defn entry-at
+  "CID の entry 1 つ（block の CID も検証する）。無いか壊れていれば nil。"
+  [get-fn cid]
+  (try (chain/commit-info get-fn cid)
+       (catch #?(:clj Exception :cljs :default) _ nil)))
+
+(defn parse-inviters
+  "`RELAY_INVITER_ROOTS`（カンマ区切りの DID）を集合にする。未設定・空は空集合
+  —— 既定は閉じる。"
+  [configured]
+  (if (str/blank? (str configured))
+    #{}
+    (->> (str/split (str configured) #",") (map str/trim) (remove str/blank?) set)))
+
+(def receipt-schema "mail-relay.receipt.v1")
+
+(defn receipt-message
+  "relay が receipt に署名する文字列。root・差出人・宛先・CID・時刻を全部覆う
+  —— どれか 1 つでも落とすと、別の root や別の相手への返信に付け替えられる。"
+  [r]
+  (str receipt-schema "\n" (get r "root") "\n" (get r "from") "\n" (get r "to")
+       "\n" (get r "msg") "\n" (get r "at")))
+
+(defn receipts-of [entry] (vec (get-in entry [:state "receipts"])))
+
+(defn normalize-address [a]
+  (some-> a str str/trim str/lower not-empty))
+
+(defn- whole? [x] (integer? x))
+
+(defn- entry-problem
+  "1 entry の形の検査。問題があれば理由を返す。"
+  [{:keys [state]}]
+  (let [t (get state "type")]
+    (cond
+      (not (contains? entry-types t)) :mail-relay.ito/unknown-entry-type
+      (not (whole? (get state "at"))) :mail-relay.ito/missing-time
+      (and (= "mail/send" t)
+           (not (and (sequential? (get state "to")) (seq (get state "to")))))
+      :mail-relay.ito/send-without-recipients
+      (and (contains? state "receipts")
+           (not (and (sequential? (get state "receipts"))
+                     (every? map? (get state "receipts")))))
+      :mail-relay.ito/malformed-receipts
+      (and (= "inbox/open" t) (str/blank? (str (get state "invite"))))
+      :mail-relay.ito/open-without-invite
+      (and (= "invite/issue" t)
+           (not (and (str/starts-with? (str (get state "invitee")) "did:key:")
+                     (whole? (get state "inboxes"))
+                     (whole? (get state "expires")))))
+      :mail-relay.ito/malformed-invite
+      :else nil)))
+
+(defn read-chain
+  "head から糸を読み、形を検査する。
+
+  -> `{:mail-relay/decision :read :mail-relay.ito/entries [commit-info …]}`（古い順）
+     `{:mail-relay/decision :refuse :mail-relay/reason …}`
+
+  検査すること: 連鎖が CID と seq で正しい（`chain/verify-chain`）、すべての
+  entry の actor が `actor`、型が既知、時刻が減らない。署名はここでは見ない
+  （host が `signatures-to-check` で確かめる）。"
+  [get-fn head actor]
+  (cond
+    (str/blank? (str head))
+    (refuse :mail-relay.ito/missing-head)
+
+    (not (try (chain/verify-chain get-fn head) (catch #?(:clj Exception :cljs :default) _ false)))
+    (refuse :mail-relay.ito/broken-chain
+            :mail-relay/basis "block が欠けているか、CID か seq が合わない")
+
+    :else
+    (let [entries (mapv #(chain/commit-info get-fn (:cid %)) (chain/chain get-fn head))]
+      (cond
+        (some #(not= actor (:actor %)) entries)
+        (refuse :mail-relay.ito/foreign-entry
+                :mail-relay/basis "糸には root 自身の entry だけが入る")
+
+        (some entry-problem entries)
+        (refuse (some entry-problem entries))
+
+        (some (fn [[a b]] (< (get-in b [:state "at"]) (get-in a [:state "at"])))
+              (partition 2 1 entries))
+        (refuse :mail-relay.ito/time-goes-backwards)
+
+        :else
+        {:mail-relay/decision :read :mail-relay.ito/entries entries}))))
+
+(defn- ancestors-of
+  "head から遡れる CID の集合（head 自身を含む）。読めない block で止まる。"
+  [get-fn head]
+  (loop [cid head acc #{}]
+    (if (or (nil? cid) (contains? acc cid))
+      acc
+      (let [info (try (chain/commit-info get-fn cid) (catch #?(:clj Exception :cljs :default) _ nil))]
+        (if-not info acc (recur (:prev info) (conj acc cid)))))))
+
+(defn relation
+  "relay が最後に見た head（`seen`）と、いま出された head（`head`）の関係。
+
+  -> :fresh    この relay はまだこの糸を見ていない
+     :same     同じ head をもう一度出した（同じ entry で 2 回目の操作はさせない）
+     :extends  seen の先に積んだ
+     :stale    seen より古い head を出した
+     :fork     どちらも他方を含まない —— 分岐"
+  [get-fn seen head]
+  (cond
+    (nil? seen) :fresh
+    (= seen head) :same
+    (contains? (ancestors-of get-fn head) seen) :extends
+    (contains? (ancestors-of get-fn seen) head) :stale
+    :else :fork))
+
+(defn fork-evidence
+  "分岐した 2 つの head から、同じ seq に立つ別々の entry の組を返す。
+  返る 2 つの CID の署名が両方とも actor のものと確かめられれば、それが warrant。"
+  [get-fn seen head]
+  (let [a (chain/chain get-fn seen)
+        b (chain/chain get-fn head)
+        [x y] (first (filter (fn [[x y]] (not= (:cid x) (:cid y))) (map vector a b)))]
+    (when (and x y)
+      {:mail-relay.ito/seq (:seq x)
+       :mail-relay.ito/a (:cid x)
+       :mail-relay.ito/b (:cid y)})))
+
+(defn new-entries
+  "seen より後の entry（この relay がまだ署名を確かめていないもの）。"
+  [entries seen]
+  (if-let [i (first (keep-indexed (fn [i e] (when (= seen (:cid e)) i)) entries))]
+    (subvec entries (inc i))
+    entries))
+
+(defn- fresh-time? [at now limits]
+  (<= (abs (- now at)) (:mail-relay.ito/clock-skew-ms limits)))
+
+(defn admit-open
+  "糸の head が、この invite で箱を 1 つ開く entry として通るか。
+
+  `invite` は招く側の invite/issue の commit-info（host が block から引いた
+  もの、署名はまだ確かめていない）。`inviters` は招いてよい DID の集合。
+
+  使った回数はサーバではなく、この糸にある inbox/open のうち同じ invite を
+  指すものを数えて決める。"
+  [entries {:keys [invite inviters now limits]}]
+  (let [limits (merge default-limits limits)
+        head (peek entries)
+        st (:state head)
+        ist (:state invite)
+        actor (:actor head)]
+    (cond
+      (not= "inbox/open" (get st "type"))
+      (refuse :mail-relay.ito/head-is-not-an-open)
+
+      (not (fresh-time? (get st "at") now limits))
+      (refuse :mail-relay.ito/stale-entry-time)
+
+      (nil? invite)
+      (refuse :mail-relay.ito/unknown-invite)
+
+      (not= (get st "invite") (:cid invite))
+      (refuse :mail-relay.ito/unknown-invite)
+
+      (not= "invite/issue" (get ist "type"))
+      (refuse :mail-relay.ito/not-an-invite)
+
+      (empty? inviters)
+      (refuse :mail-relay.ito/no-inviters-configured
+              :mail-relay/basis "招いてよい DID が 1 つも無い。既定は閉じる")
+
+      (not (contains? inviters (:actor invite)))
+      (refuse :mail-relay.ito/not-an-inviter)
+
+      (not= actor (get ist "invitee"))
+      (refuse :mail-relay.ito/invite-is-for-someone-else)
+
+      (> (get ist "expires") (+ (get ist "at") (:mail-relay.ito/max-invite-ttl-ms limits)))
+      (refuse :mail-relay.ito/invite-ttl-too-long)
+
+      (>= now (get ist "expires"))
+      (refuse :mail-relay.ito/invite-expired)
+
+      (not (<= 1 (get ist "inboxes") (:mail-relay.ito/max-inboxes-per-invite limits)))
+      (refuse :mail-relay.ito/invite-inboxes-out-of-range)
+
+      (> (count (filter #(and (= "inbox/open" (get-in % [:state "type"]))
+                              (= (:cid invite) (get-in % [:state "invite"])))
+                        entries))
+         (get ist "inboxes"))
+      (refuse :mail-relay.ito/invite-used-up)
+
+      :else
+      {:mail-relay/decision :open :mail-relay/invited-by (:actor invite)})))
+
+(defn- replied-to
+  "その entry の receipt が示す、先に書いてきた相手。"
+  [e]
+  (set (keep #(normalize-address (get % "from")) (receipts-of e))))
+
+(defn first-contacts
+  "各 mail/send entry について、それより前の糸に一度も出てこず、receipt で
+  先に書いてきたことも示されていない宛先。-> [[entry #{address …}] …]"
+  [entries]
+  (loop [es entries seen #{} acc []]
+    (if-let [e (first es)]
+      (if (= "mail/send" (get-in e [:state "type"]))
+        (let [to (set (keep normalize-address (get-in e [:state "to"])))
+              fresh (into #{} (remove (into seen (replied-to e))) to)]
+          (recur (rest es) (into seen to) (conj acc [e fresh])))
+        (recur (rest es) seen acc))
+      acc)))
+
+(defn receipt-problem
+  "糸の receipt の、署名以外の検査。`relays` は信頼する relay の DID の集合。"
+  [entries relays]
+  (let [rs (for [e entries r (receipts-of e)] [e r])]
+    (cond
+      (some (fn [[_ r]] (not (and (string? (get r "sig")) (string? (get r "relay"))
+                                  (string? (get r "from")) (integer? (get r "at")))))
+            rs)
+      :mail-relay.ito/malformed-receipts
+
+      (some (fn [[e r]] (not= (:actor e) (get r "root"))) rs)
+      :mail-relay.ito/receipt-for-someone-else
+
+      (some (fn [[_ r]] (not (contains? relays (get r "relay")))) rs)
+      :mail-relay.ito/untrusted-receipt
+
+      :else nil)))
+
+(defn receipts-to-check
+  "host が Ed25519 で確かめるべき receipt の署名。-> [{:did :message :sig} …]"
+  [entries]
+  (vec (for [e entries r (receipts-of e)]
+         {:did (get r "relay") :message (receipt-message r) :sig (get r "sig")})))
+
+(defn admit-send
+  "糸の head が、この 1 通を出す entry として通るか。
+
+  **通数ではなく、初めて連絡する相手の数に上限をかける。** 前に送ったことの
+  ある相手への送信は数えない。窓の中で初めての相手が上限を超えたら断る。"
+  [entries {:keys [to now limits receipt-relays]}]
+  (let [limits (merge default-limits limits)
+        head (peek entries)
+        st (:state head)
+        requested (set (keep normalize-address to))
+        entry-to (set (keep normalize-address (get st "to")))
+        window-start (- now (:mail-relay.ito/window-ms limits))
+        used (->> (first-contacts entries)
+                  (filter (fn [[e _]] (>= (get-in e [:state "at"]) window-start)))
+                  (map (comp count second))
+                  (reduce + 0))
+        cap (:mail-relay.ito/first-contacts-per-window limits)]
+    (cond
+      (not= "mail/send" (get st "type"))
+      (refuse :mail-relay.ito/head-is-not-a-send)
+
+      (not (fresh-time? (get st "at") now limits))
+      (refuse :mail-relay.ito/stale-entry-time)
+
+      (receipt-problem entries (set receipt-relays))
+      (refuse (receipt-problem entries (set receipt-relays)))
+
+      (not= requested entry-to)
+      (refuse :mail-relay.ito/recipients-do-not-match
+              :mail-relay/basis "糸に書いた宛先と、出そうとしている宛先が違う")
+
+      (> (count entry-to) (:mail-relay.ito/recipients-per-message limits))
+      (refuse :mail-relay.ito/too-many-recipients
+              :mail-relay.ito/limit (:mail-relay.ito/recipients-per-message limits))
+
+      (> used cap)
+      (refuse :mail-relay.ito/first-contact-budget-exhausted
+              :mail-relay.ito/used used :mail-relay.ito/limit cap
+              :mail-relay/basis "初めて連絡する相手の上限。返信や、前に送った相手への送信は数えない")
+
+      :else
+      {:mail-relay/decision :send
+       :mail-relay.ito/first-contacts-used used
+       :mail-relay.ito/first-contacts-left (- cap used)})))
+
+(defn signatures-to-check
+  "host が Ed25519 で確かめるべき署名。-> [{:did :cid :message} …]"
+  [entries extra]
+  (vec (concat (map (fn [e] {:did (:actor e) :cid (:cid e)
+                             :message (signing-message (:cid e))})
+                    entries)
+               (map (fn [e] {:did (:actor e) :cid (:cid e)
+                             :message (signing-message (:cid e))})
+                    (remove nil? extra)))))
+
+(def status-for-reason
+  {:mail-relay.ito/missing-head 400
+   :mail-relay.ito/broken-chain 400
+   :mail-relay.ito/foreign-entry 400
+   :mail-relay.ito/unknown-entry-type 400
+   :mail-relay.ito/missing-time 400
+   :mail-relay.ito/send-without-recipients 400
+   :mail-relay.ito/open-without-invite 400
+   :mail-relay.ito/malformed-invite 400
+   :mail-relay.ito/time-goes-backwards 400
+   :mail-relay.ito/head-is-not-an-open 400
+   :mail-relay.ito/head-is-not-a-send 400
+   :mail-relay.ito/stale-entry-time 400
+   :mail-relay.ito/recipients-do-not-match 400
+   :mail-relay.ito/unknown-invite 403
+   :mail-relay.ito/not-an-invite 403
+   :mail-relay.ito/no-inviters-configured 403
+   :mail-relay.ito/not-an-inviter 403
+   :mail-relay.ito/invite-is-for-someone-else 403
+   :mail-relay.ito/invite-ttl-too-long 403
+   :mail-relay.ito/invite-expired 403
+   :mail-relay.ito/invite-inboxes-out-of-range 403
+   :mail-relay.ito/invite-used-up 403
+   :mail-relay.ito/too-many-recipients 403
+   :mail-relay.ito/first-contact-budget-exhausted 429
+   :mail-relay.ito/missing-signature 401
+   :mail-relay.ito/bad-signature 403
+   :mail-relay.ito/stale-head 409
+   :mail-relay.ito/forked 403
+   :mail-relay.ito/malformed-receipts 400
+   :mail-relay.ito/receipt-for-someone-else 403
+   :mail-relay.ito/untrusted-receipt 403
+   :mail-relay.ito/bad-receipt 403
+   :mail-relay/origin-slot-taken 409})

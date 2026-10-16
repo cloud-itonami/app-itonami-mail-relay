@@ -85,15 +85,13 @@
         (.then (fn [^js r] (is (= 503 (.-status r))) (done))))))
 
 (defn- open-inbox!
-  "箱を開くには invite が要る（ADR-2610101117）。招く側をこの env の許可
-  リストに載せ、本物の署名で invite を発行してから開く。"
+  "箱を開くには root の糸と invite が要る（ADR-2610101117）。招く側をこの env の
+  許可リストに載せ、本物の署名で糸を作ってから開く。"
   [env]
-  (-> (fakes/ed25519-did)
-      (.then (fn [{:keys [kp did]}]
-               (aset env "RELAY_INVITER_ROOTS" did)
-               (fakes/issue-invite env kp did {})))
-      (.then #(.json ^js %))
-      (.then (fn [^js b] (fakes/open-inbox env (.-invite b) "203.0.113.21")))
+  (-> (fakes/world {})
+      (.then (fn [w]
+               (aset env "RELAY_INVITER_ROOTS" (:did @(:inviter w)))
+               (fakes/open-inbox (assoc w :env env) "203.0.113.21")))
       (.then #(.json ^js %))
       (.then #(js->clj % :keywordize-keys true))))
 
