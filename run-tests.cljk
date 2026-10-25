@@ -9,10 +9,13 @@
 (ns run-tests
   (:require [cljs.test :as t]
             [mail-relay.account-test]
+            [mail-relay.admission-test]
             [mail-relay.api-test]
             [mail-relay.authz-test]
             [mail-relay.inbound-test]
             [mail-relay.ito-test]
+            [mail-relay.jmap-test]
+            [mail-relay.p2p-test]
             [mail-relay.resend-test]
             [mail-relay.seal-test]
             [mail-relay.send-test]
@@ -27,9 +30,12 @@
     (js/process.exit 1)))
 
 (t/run-tests 'mail-relay.account-test
+             'mail-relay.admission-test
              'mail-relay.api-test
              'mail-relay.authz-test
              'mail-relay.ito-test
+             'mail-relay.jmap-test
+             'mail-relay.p2p-test
              'mail-relay.inbound-test
              'mail-relay.resend-test
              'mail-relay.seal-test

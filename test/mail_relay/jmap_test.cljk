@@ -1,0 +1,19 @@
+(ns mail-relay.jmap-test
+  (:require [kotoba.test :refer [deftest is]]
+            [mail-relay.jmap :as jmap]))
+
+(deftest session-declares-mail-capability
+  (let [s (jmap/session {:account-id "a1" :username "alias@mail.itonami.cloud"
+                         :api-url "https://local.invalid/jmap"
+                         :download-url "https://local.invalid/blob/{blobId}"})]
+    (is (= "a1" (get-in s [:primaryAccounts jmap/mail-capability])))
+    (is (contains? (:capabilities s) jmap/core-capability))
+    (is (contains? (:capabilities s) jmap/mail-capability))))
+
+(deftest opened-message-projects-to-jmap
+  (let [e (jmap/email {:id "m1" :from [{:email "a@example.com"}]
+                       :to [{:email "b@example.com"}] :subject "hello"
+                       :received-at "2026-10-25T00:00:00Z" :size 42})]
+    (is (= "m1" (:id e)))
+    (is (= {"inbox" true} (:mailboxIds e)))
+    (is (= "hello" (:subject e)))))

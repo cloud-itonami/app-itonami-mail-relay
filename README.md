@@ -25,6 +25,9 @@ POST /v1/inboxes/{inbox}/messages ─> persona が From を決める ─> Resend
 | `mail-relay.store` | 保管の形（鍵名・平文で残るもの・CID） | 純 |
 | `mail-relay.authz` | route の `:auth` を実際の検査へ | 純 |
 | `mail-relay.api` | route 表（**データ**。dispatch も公開文書もここから） | 純 |
+| `mail-relay.admission` | SMTP/P2P 共通の deliver/quarantine/reject | 純 |
+| `mail-relay.p2p` | 署名対象・expiry・replay を固定する暗号文 envelope | 純 |
+| `mail-relay.jmap` | 復号後 mailbox の client-side JMAP projection | 純 |
 | `mail-relay.seal` | 封（AES-256-GCM / X25519） | CLJS |
 | `mail-relay.resend` | Resend の両側（webhook 検証・送信実行） | CLJS |
 | `mail-relay.root-auth` | `did:key` の Ed25519 で署名検証 | CLJS |
@@ -217,20 +220,19 @@ POST   /v1/inboxes/{inbox}/webhooks       :key   届くのは index だけ
 (account/rotate r {:id "inbox_a" :root "did:key:z6Mk…" :new-key-digest "sha256:…"})
 ```
 
-## テスト
+## テストと native qualification
 
-```bash
-npm install
-npm test                    # ClojureScript（Worker と同じ経路）— 封も Ed25519 も本物
-kbb -M:local:test       # JVM
-```
+旧 `npm test` は kbb/Sci と表示されるが、依存解決で nbb と JVM を起動するため
+acceptance gate から退役した。JVM・nbb・shadow-cljs を fallback にしない。
 
-Worker は CLJS で動くので、JVM で通ることは証拠にならない。両方で回す。
-判断の層は `.cljc` なので**同じテストが両方で走る**。
+必要な正規 gate は Amu selfhost + Kotoba native であり、forbidden launcher の
+negative control を含む。2026-10-25 時点の public native Amu は
+`x86_64-linux-static` だけが qualified で、browser/Worker project link は未対応。
+したがって、この checkout の source tests は存在するが native qualification は
+**blocked**。parser、旧 test、生成済み Worker を代用して green としない。
 
-- JVM: 45 tests / 199 assertions
-- CLJS: 82 tests / 367 assertions（`seal_test` / `resend_test` / `worker_test` は
-  CLJS のみ —— Web Crypto に同期 API が無い）
+新しい SMTP/P2P admission、暗号文 envelope、client-side JMAP projection の境界は
+[`docs/itonami-mail-mvp.md`](docs/itonami-mail-mvp.md) にまとめてある。
 
 `worker_test.cljs` は Cloudflare の binding だけを偽物にして、開く→顔を発行→
 受ける→一覧→誰から来たか→出す、を端から端まで通す。`resend_test.cljs` は
@@ -272,7 +274,9 @@ npx wrangler deploy
   持たない。
 - **最後に見た head の保管**は R2。消えても正しさは壊れないが、その relay で
   古い head を出し直される余地が増える。
-- **PoW・評判・招いた側の予算を減らすこと**はまだ。receipt に有効期限は無い
+- **admission の host 接続**。純粋な `mail-relay.admission` は PoW/invite/postage、
+  rate、domain authentication、任意の humanity score を合成するが、Worker の
+  SMTP/P2P intake へはまだ接続していない。receipt に有効期限は無い
   （一度書いてきた人への返信は、いつでも返信として扱う）。
 - **origin あたりの枠は best-effort**。registry を KV に置いており、KV は結果
   整合なので、同一 origin から同時に 2 本開くと両方通りうる。origin は依頼の

@@ -1,0 +1,32 @@
+(ns mail-relay.admission-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [mail-relay.admission :as admission]))
+
+(deftest first-contact-never-rides-a-score-alone
+  (testing "高い Human Passport score だけでは inbox に入らない"
+    (let [r (admission/decide {:channel :p2p :bytes 100 :relationship :unknown
+                               :envelope {:signature-valid? true :fresh? true}
+                               :human-score 100})]
+      (is (= :quarantine (:mail-relay.admission/action r)))
+      (is (= :normal (:mail-relay.admission/priority r)))))
+  (testing "score が無くても既知の相手は通る"
+    (is (= :deliver
+           (:mail-relay.admission/action
+            (admission/decide {:channel :p2p :bytes 100 :relationship :known
+                               :envelope {:signature-valid? true :fresh? true}}))))))
+
+(deftest fail-closed-and-explicit-first-contact
+  (is (= :reject (:mail-relay.admission/action
+                  (admission/decide {:channel :p2p :relationship :known
+                                     :envelope {:signature-valid? false :fresh? true}}))))
+  (is (= :deliver (:mail-relay.admission/action
+                   (admission/decide {:channel :p2p :relationship :unknown
+                                      :envelope {:signature-valid? true :fresh? true}
+                                      :proof {:kind :postage :valid? true}
+                                      :receiver-policy {:unknown-sender :deliver}})))))
+
+(deftest smtp-authentication-failure-is-not-silent-delivery
+  (is (= :quarantine
+         (:mail-relay.admission/action
+          (admission/decide {:channel :smtp :relationship :known
+                             :authentication {:spf :fail :dkim :fail :dmarc :fail}})))))
