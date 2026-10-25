@@ -1,5 +1,9 @@
 # app-mail-relay
 
+**Tayori（たより）** は Itonami のユーザー向け mail dapp 名で、この repository は
+その SMTP/P2P 配送サービスを担う。UI・ローカル mailbox・復号後 JMAP projection は
+`app-itonami-tayori`、wire protocol namespace は `itonami.mail` とする。
+
 **`relay.itonami.cloud` —— エージェント向けメールの受信箱。** エージェントが
 自分の箱を持ち、相手ごとに別の顔で受け取り、要らなくなったら 1 本だけ止める。
 **送受信とも Resend backed**、受けた 1 通は edge で封をして R2 に置き、

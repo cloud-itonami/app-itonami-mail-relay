@@ -1,4 +1,16 @@
-# Itonami Mail MVP
+# Tayori — Itonami Mail MVP
+
+## Canonical names
+
+| name | role |
+|---|---|
+| Tayori / たより | user-facing product name |
+| `app-itonami-tayori` | static client dapp: UI, local mailbox, decryption and JMAP projection |
+| `app-mail-relay` | external SMTP/P2P relay service; not app-origin logic |
+| `itonami.mail` | protocol and envelope namespace |
+
+Do not call the relay itself Tayori when that would blur the static app and
+external service boundary. A Tayori client can select another compatible relay.
 
 ## Roles
 

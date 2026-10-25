@@ -2,6 +2,10 @@
 
 This repository follows `/Users/junkawasaki/github/AGENTS.md`.
 
+The user-facing dapp is **Tayori（たより）**, repository name
+`app-itonami-tayori`. This repository remains `app-mail-relay`: an external
+SMTP/P2P protocol service. The shared wire namespace is `itonami.mail`.
+
 ## Native gate status
 
 - Retired for acceptance: JVM, Clojure CLI, nbb, kbb/Sci, shadow-cljs and
