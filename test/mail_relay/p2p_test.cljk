@@ -1,0 +1,25 @@
+(ns mail-relay.p2p-test
+  (:require [kotoba.test :refer [deftest is testing]]
+            [mail-relay.p2p :as p2p]))
+
+(def valid-envelope
+  {:schema p2p/schema :id "m1" :sender "did:key:sender" :recipient "did:key:recipient"
+   :ciphertext-cid "bafy-ciphertext" :created-at 1000 :expires-at 2000
+   :nonce "n1" :signature "sig"})
+
+(deftest envelope-is-ciphertext-only-and-replay-bound
+  (let [p (p2p/verification-plan valid-envelope 1500)]
+    (is (= :verify (:mail-relay.p2p/decision p)))
+    (is (= "did:key:recipient:n1" (:mail-relay.p2p/replay-key p)))
+    (is (= "did:key:sender" (:mail-relay.p2p/did p))))
+  (testing "平文を wire envelope に混ぜたら拒否"
+    (is (= [:plaintext-field]
+           (p2p/validation-errors (assoc valid-envelope :subject "secret") 1500))))
+  (testing "期限切れは拒否"
+    (is (= [:expired] (p2p/validation-errors valid-envelope 2000)))))
+
+(deftest signature-covers-routing-and-expiry
+  (is (not= (p2p/signing-message valid-envelope)
+            (p2p/signing-message (assoc valid-envelope :recipient "did:key:other"))))
+  (is (not= (p2p/signing-message valid-envelope)
+            (p2p/signing-message (assoc valid-envelope :expires-at 3000)))))

@@ -1,0 +1,37 @@
+(ns mail-relay.jmap
+  "復号済み local mailbox を JMAP Mail の形へ写す client-side projection。
+
+  relay は本文や References を読めないので JMAP search/thread server にはならない。
+  鍵を持つ browser/desktop client が messages を開き、この projection を作る。")
+
+(def core-capability "urn:ietf:params:jmap:core")
+(def mail-capability "urn:ietf:params:jmap:mail")
+
+(defn session
+  [{:keys [account-id username api-url download-url]}]
+  {:capabilities {core-capability {:maxSizeUpload (* 25 1024 1024)}
+                  mail-capability {}}
+   :accounts {account-id {:name username
+                          :isPersonal true
+                          :isReadOnly false
+                          :accountCapabilities {mail-capability {}}}}
+   :primaryAccounts {mail-capability account-id}
+   :username username
+   :apiUrl api-url
+   :downloadUrl download-url
+   :state "client-local"})
+
+(defn email
+  "復号後の mail model を JMAP Email の最小互換形にする。"
+  [{:keys [id blob-id thread-id mailbox-ids from to cc subject received-at size keywords]}]
+  {:id id
+   :blobId (or blob-id id)
+   :threadId (or thread-id id)
+   :mailboxIds (or mailbox-ids {"inbox" true})
+   :keywords (or keywords {})
+   :from (vec from)
+   :to (vec to)
+   :cc (vec cc)
+   :subject (or subject "")
+   :receivedAt received-at
+   :size (or size 0)})

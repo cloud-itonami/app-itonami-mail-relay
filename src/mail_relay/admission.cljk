@@ -1,0 +1,59 @@
+(ns mail-relay.admission
+  "SMTP と P2P に共通する受信 admission。
+
+  判定は値だけを返す。Human Passport のような外部スコアは優先順位の補助に
+  使えても、それだけで deliver や reject を決めない。未知の相手からの本文は
+  first-contact quarantine を越えるまで inbox に入れない。")
+
+(def schema "mail-relay.admission.v1")
+
+(def default-limits
+  {:mail-relay.admission/max-bytes (* 25 1024 1024)
+   :mail-relay.admission/max-per-hour 60})
+
+(defn- result [action reasons & [attrs]]
+  (merge {:mail-relay.admission/action action
+          :mail-relay.admission/reasons (vec reasons)}
+         attrs))
+
+(defn decide
+  "受信を `:deliver` / `:quarantine` / `:reject` に分ける。
+
+  channel=:smtp は domain authentication、channel=:p2p は envelope の署名・
+  freshness・replay 検査を前提にする。unknown sender を deliver にするには、
+  invitation / postage / pow のいずれかと明示的な receiver policy が必要。"
+  [{:keys [channel bytes blocked? relationship authentication envelope
+           rate proof receiver-policy human-score limits]}]
+  (let [limits (merge default-limits limits)
+        too-large? (> (or bytes 0) (:mail-relay.admission/max-bytes limits))
+        too-fast? (> (or (:per-hour rate) 0)
+                     (:mail-relay.admission/max-per-hour limits))
+        known? (contains? #{:known :reply :allowlisted} relationship)
+        cost? (and (:valid? proof)
+                   (contains? #{:invite :postage :pow} (:kind proof)))
+        smtp-pass? (or (= :pass (:dmarc authentication))
+                       (and (= :pass (:spf authentication))
+                            (= :pass (:dkim authentication))))
+        p2p-pass? (and (:signature-valid? envelope)
+                       (:fresh? envelope)
+                       (not (:replayed? envelope)))]
+    (cond
+      blocked? (result :reject [:blocked])
+      too-large? (result :reject [:too-large])
+      too-fast? (result :reject [:rate-limit])
+      (and (= :p2p channel) (not p2p-pass?))
+      (result :reject [:invalid-p2p-envelope])
+      (and (= :smtp channel) known? (not smtp-pass?))
+      (result :quarantine [:known-sender-authentication-failed])
+      known? (result :deliver [:existing-relationship])
+      (and cost? (= :deliver (:unknown-sender receiver-policy)))
+      (result :deliver [:receiver-approved-first-contact]
+              {:mail-relay.admission/human-score-used? false})
+      :else
+      (result :quarantine
+              (cond-> [:first-contact]
+                (and (= :smtp channel) (not smtp-pass?)) (conj :domain-authentication-failed)
+                (not cost?) (conj :missing-cost-proof))
+              {:mail-relay.admission/priority
+               (if (and (number? human-score) (>= human-score 50)) :normal :low)
+               :mail-relay.admission/human-score-used? (number? human-score)}))))

@@ -1,0 +1,49 @@
+(ns mail-relay.p2p
+  "Itonami 同士で運ぶ暗号化 mail envelope の純粋な wire contract。
+
+  暗号化や署名検証そのものは host capability。ここは平文を混ぜず、何を署名し、
+  host が何を検査すべきかを固定する。")
+
+(def schema "itonami.mail.p2p-envelope.v1")
+(def max-ttl-ms (* 7 24 60 60 1000))
+
+(def forbidden-plaintext-keys
+  #{:subject :text :html :body :attachments :headers :message})
+
+(def signed-fields
+  [:schema :id :sender :recipient :ciphertext-cid :created-at :expires-at :nonce])
+
+(defn signing-message [envelope]
+  (pr-str (mapv #(get envelope %) signed-fields)))
+
+(defn validation-errors
+  [envelope now]
+  (let [created (:created-at envelope)
+        expires (:expires-at envelope)]
+    (cond-> []
+      (not= schema (:schema envelope)) (conj :wrong-schema)
+      (not (string? (:id envelope))) (conj :missing-id)
+      (not (string? (:sender envelope))) (conj :missing-sender)
+      (not (string? (:recipient envelope))) (conj :missing-recipient)
+      (not (string? (:ciphertext-cid envelope))) (conj :missing-ciphertext-cid)
+      (not (string? (:nonce envelope))) (conj :missing-nonce)
+      (not (number? created)) (conj :missing-created-at)
+      (not (number? expires)) (conj :missing-expires-at)
+      (and (number? expires) (<= expires now)) (conj :expired)
+      (and (number? created) (number? expires) (> (- expires created) max-ttl-ms))
+      (conj :ttl-too-long)
+      (some #(contains? envelope %) forbidden-plaintext-keys) (conj :plaintext-field))) )
+
+(defn verification-plan
+  "host が行う検査。署名は envelope の sender DID に束縛され、nonce は受取人の
+  replay store で一度だけ受理する。"
+  [envelope now]
+  (let [errors (validation-errors envelope now)]
+    (if (seq errors)
+      {:mail-relay.p2p/decision :reject :mail-relay.p2p/errors errors}
+      {:mail-relay.p2p/decision :verify
+       :mail-relay.p2p/did (:sender envelope)
+       :mail-relay.p2p/signature (:signature envelope)
+       :mail-relay.p2p/message (signing-message envelope)
+       :mail-relay.p2p/replay-key (str (:recipient envelope) ":" (:nonce envelope))
+       :mail-relay.p2p/ciphertext-cid (:ciphertext-cid envelope)})))
