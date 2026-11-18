@@ -1,17 +1,19 @@
 # Host-local blocks (command_allowlist, onboarding, secrets, skills, terminal) are kept on the host and omitted here.
 model:
-  provider: murakumo
-  base_url: https://api.murakumo.cloud/v1
-  default: mishima
+  provider: openrouter
+  base_url: https://openrouter.ai/api/v1
+  default: xiaomi/mimo-v2.6-pro
   max_tokens: 8192
   context_length: 131072
 providers:
-  murakumo:
-    base_url: https://api.murakumo.cloud/v1
+  openrouter:
+    base_url: https://openrouter.ai/api/v1
     api_mode: chat_completions
+    key_env: OPENROUTER_API_KEY
     stale_timeout_seconds: 600
-    request_timeout_seconds: 900
-    key_env: CUSTOM_PROVIDER_MURAKUMO_KEY
+    extra_headers:
+      HTTP-Referer: https://itonami.cloud
+      X-OpenRouter-Title: Itonami By KotobaLabs
 fallback_providers: []
 web:
   backend: nous
@@ -81,11 +83,11 @@ moa:
   presets:
     default:
       reference_models:
-      - provider: murakumo
-        model: mishima
-        enabled: true
-        base_url: https://api.murakumo.cloud/v1
-        key_env: CUSTOM_PROVIDER_MURAKUMO_KEY
+        - provider: murakumo
+          model: mishima
+          enabled: true
+          base_url: https://api.murakumo.cloud/v1
+          key_env: CUSTOM_PROVIDER_MURAKUMO_KEY
       aggregator:
         provider: murakumo
         model: mishima
@@ -94,11 +96,11 @@ moa:
       degraded_reference_policy: loud
       fanout: user_turn
   reference_models:
-  - provider: murakumo
-    model: mishima
-    enabled: true
-    base_url: https://api.murakumo.cloud/v1
-    key_env: CUSTOM_PROVIDER_MURAKUMO_KEY
+    - provider: murakumo
+      model: mishima
+      enabled: true
+      base_url: https://api.murakumo.cloud/v1
+      key_env: CUSTOM_PROVIDER_MURAKUMO_KEY
   aggregator:
     provider: murakumo
     model: mishima
@@ -126,6 +128,6 @@ mcp_servers:
   github-forest:
     command: /opt/homebrew/bin/node
     args:
-    - ~/github/com-junkawasaki/west-manifest/scripts/forest-maintenance.mjs
-    - mcp
+      - ~/github/com-junkawasaki/west-manifest/scripts/forest-maintenance.mjs
+      - mcp
     lazy: true
