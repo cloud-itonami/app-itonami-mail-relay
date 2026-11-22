@@ -5,6 +5,9 @@ description: Use when deploying or verifying the ipfs Worker planes, adding a mi
 
 # kotobase bytes plane — net-kotobase/ipfs Worker と zone 群
 
+> **現在（2026-11-22、JUN-1441）:** `ipfs.yataverse.com` と `{cid}.ipfs.yataverse.com` は停止・退役。raw block は `https://yataverse.com/ipfs/<cid>`（network-awai/app-itonami-yataverse の yataverse-bytes Worker）から読み、sha256 が CID と一致することを確かめる。以下は net-kotobase/ipfs Worker の記録。
+
+
 Worker 1 本（`net-kotobase-ipfs`）が 3 zone を配る: bytes 面の正本
 `{cid}.ipfs.kotobase.net`、mirror `*.ipfs/.ipns.yataverse.com`（分散型データレイク面）、
 web/origin 面 `*.ipfs/.ipns.itonami.cloud`。正本 ADR は superproject
